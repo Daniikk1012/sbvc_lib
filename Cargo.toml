@@ -1,7 +1,11 @@
 [package]
 name = "sbvc_lib"
+description = "Backend for Single Binary file Version Control system"
+readme = "README.md"
+repository = "https://github.com/Daniikk1012/sbvc_lib"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0"
 
 [dependencies]
 futures = "0.3"
