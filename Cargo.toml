@@ -1,0 +1,40 @@
+[package]
+name = "sbvc_lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3"
+sqlx = { version = "0.5", features = ["sqlite"] }
+wgdiff = "0.4"
+actix-rt = { version = "2.4", optional = true }
+async-std = { version = "1.10", features = ["attributes"], optional = true }
+tokio = { version = "1.14", features = ["macros"], optional = true }
+
+[features]
+default = ["runtime-async-std-rustls"]
+
+runtime-actix-native-tls = [
+    "actix-rt",
+    "sqlx/runtime-actix-native-tls",
+]
+runtime-async-std-native-tls = [
+    "async-std",
+    "sqlx/runtime-async-std-native-tls",
+]
+runtime-tokio-native-tls = [
+    "tokio",
+    "sqlx/runtime-tokio-native-tls",
+]
+runtime-actix-rustls = [
+    "actix-rt",
+    "sqlx/runtime-actix-rustls",
+]
+runtime-async-std-rustls = [
+    "async-std",
+    "sqlx/runtime-async-std-rustls",
+]
+runtime-tokio-rustls = [
+    "tokio",
+    "sqlx/runtime-tokio-rustls",
+]
