@@ -1,4 +1,4 @@
-//! # Single Binary file Version Control System
+//! # Single Binary file Version Control system
 //!
 //! This crate is backend for SBVC that provides useful and simple API to use
 //! in the frontend.
