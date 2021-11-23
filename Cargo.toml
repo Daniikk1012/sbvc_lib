@@ -11,7 +11,6 @@ license = "GPL-3.0"
 futures = "0.3"
 sqlx = { version = "0.5", features = ["sqlite"] }
 wgdiff = "0.4"
-actix-rt = { version = "2.4", optional = true }
 async-std = { version = "1.10", features = ["attributes"], optional = true }
 tokio = { version = "1.14", features = ["macros"], optional = true }
 
@@ -19,7 +18,7 @@ tokio = { version = "1.14", features = ["macros"], optional = true }
 default = ["runtime-async-std-rustls"]
 
 runtime-actix-native-tls = [
-    "actix-rt",
+    "tokio",
     "sqlx/runtime-actix-native-tls",
 ]
 runtime-async-std-native-tls = [
@@ -31,7 +30,7 @@ runtime-tokio-native-tls = [
     "sqlx/runtime-tokio-native-tls",
 ]
 runtime-actix-rustls = [
-    "actix-rt",
+    "tokio",
     "sqlx/runtime-actix-rustls",
 ]
 runtime-async-std-rustls = [

@@ -28,19 +28,37 @@ async fn data() -> sqlx::Result<()> {
     let database = Database::new(FILE.into()).await?;
     fs::write(FILE, DATA_1)?;
     database.versions().commit(&database).await?;
-    assert_eq!(database.versions().children()[0].data(), DATA_1);
+    assert_eq!(database.versions().children().await[0].data().await, DATA_1);
     database.close().await;
 
     let database = Database::new(FILE.into()).await?;
     fs::write(FILE, DATA_2)?;
-    database.versions().children()[0].commit(&database).await?;
-    assert_eq!(database.versions().children()[0].data(), DATA_1);
-    assert_eq!(database.versions().children()[0].children()[0].data(), DATA_2);
+    database.versions().children().await[0].commit(&database).await?;
+    assert_eq!(database.versions().children().await[0].data().await, DATA_1);
+    assert_eq!(
+        database.versions()
+            .children()
+            .await[0]
+            .children()
+            .await[0]
+            .data()
+            .await,
+        DATA_2,
+    );
     database.close().await;
 
     let database = Database::new(FILE.into()).await?;
-    assert_eq!(database.versions().children()[0].data(), DATA_1);
-    assert_eq!(database.versions().children()[0].children()[0].data(), DATA_2);
+    assert_eq!(database.versions().children().await[0].data().await, DATA_1);
+    assert_eq!(
+        database.versions()
+            .children()
+            .await[0]
+            .children()
+            .await[0]
+            .data()
+            .await,
+        DATA_2,
+    );
     database.close().await;
 
     fs::remove_file(FILE)?;
@@ -62,12 +80,12 @@ async fn delete() -> sqlx::Result<()> {
     fs::write(FILE, DATA_1)?;
     database.versions().commit(&database).await?;
     fs::write(FILE, DATA_2)?;
-    database.versions().children()[0].commit(&database).await?;
-    database.versions().children()[0].delete(&database).await?;
+    database.versions().children().await[0].commit(&database).await?;
+    database.versions().children().await[0].delete(&database).await?;
     database.close().await;
 
     let database = Database::new(FILE.into()).await?;
-    assert!(database.versions().children().is_empty());
+    assert!(database.versions().children().await.is_empty());
     database.close().await;
 
     fs::remove_file(FILE)?;
@@ -89,8 +107,8 @@ async fn rollback() -> sqlx::Result<()> {
     fs::write(FILE, DATA_1)?;
     database.versions().commit(&database).await?;
     fs::write(FILE, DATA_2)?;
-    database.versions().children()[0].commit(&database).await?;
-    database.versions().children()[0].rollback(&database)?;
+    database.versions().children().await[0].commit(&database).await?;
+    database.versions().children().await[0].rollback(&database).await?;
     assert_eq!(fs::read(FILE)?, DATA_1);
     database.close().await;
 
@@ -110,11 +128,11 @@ async fn rename() -> sqlx::Result<()> {
 
     let database = Database::new(FILE.into()).await?;
     database.versions().rename(&database, NAME.to_string()).await?;
-    assert_eq!(database.versions().name(), NAME);
+    assert_eq!(database.versions().name().await, NAME);
     database.close().await;
 
     let database = Database::new(FILE.into()).await?;
-    assert_eq!(database.versions().name(), NAME);
+    assert_eq!(database.versions().name().await, NAME);
     database.close().await;
 
     fs::remove_file(DATABASE)?;

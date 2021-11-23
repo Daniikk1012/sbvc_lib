@@ -39,15 +39,20 @@
 //! [`Version`]: Version
 
 use std::{
-    cell::RefCell, collections::HashMap, fs::File,
+    collections::HashMap, fs::File,
     io::{self, Read, Write},
     path::PathBuf, pin::Pin,
-    rc::{Rc, Weak},
+    sync::{Arc, Weak},
 };
 
 use futures::prelude::*;
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use wgdiff::{Deletion, Diff, OwnedDifference, OwnedInsertion, Patch};
+
+#[cfg(feature = "async-std")]
+use async_std::sync::RwLock;
+#[cfg(feature = "tokio")]
+use tokio::sync::RwLock;
 
 const INIT_VERSION_NAME: &'static str = "init";
 const DEFAULT_VERSION_NAME: &'static str = "unnamed";
@@ -150,7 +155,7 @@ impl Database {
 
 struct VersionInfo {
     id: u32,
-    base: Weak<RefCell<VersionInfo>>,
+    base: Weak<RwLock<VersionInfo>>,
     name: String,
     date: String,
     difference: OwnedDifference<u8>,
@@ -158,13 +163,13 @@ struct VersionInfo {
 }
 
 /// A `struct` that represents a single commit in the version tree. It uses
-/// [`Rc`] under the hood, so it is okay to [`clone`] it, as it has very little
+/// [`Arc`] under the hood, so it is okay to [`clone`] it, as it has very little
 /// cost.
 ///
-/// [`Rc`]: Rc
+/// [`Arc`]: Arc
 /// [`clone`]: Clone::clone
 #[derive(Clone)]
-pub struct Version(Rc<RefCell<VersionInfo>>);
+pub struct Version(Arc<RwLock<VersionInfo>>);
 
 impl Version {
     async fn new(pool: &SqlitePool) -> sqlx::Result<Self> {
@@ -215,7 +220,7 @@ impl Version {
         let mut map = HashMap::new();
 
         stream.try_for_each(|(info, bid)| {
-            map.insert(info.id, (Rc::new(RefCell::new(info)), bid));
+            map.insert(info.id, (Arc::new(RwLock::new(info)), bid));
             future::ready(Ok(()))
         }).await?;
 
@@ -223,8 +228,8 @@ impl Version {
 
         for (info, bid) in map.values() {
             if let Some(bid) = bid {
-                map[bid].0.borrow_mut().children.push(Version(info.clone()));
-                info.borrow_mut().base = Rc::downgrade(&map[bid].0);
+                map[bid].0.write().await.children.push(Version(info.clone()));
+                info.write().await.base = Arc::downgrade(&map[bid].0);
             } else {
                 root = Some(Version(info.clone()));
             }
@@ -239,14 +244,16 @@ impl Version {
     /// it calculates contents of the file every time this method is called
     /// using differences contained in the database, so you should either cache
     /// contents yourself, or do not call this method very often.
-    pub fn data(&self) -> Vec<u8> {
-        if let Some(base) = self.0.borrow().base.upgrade() {
-            let mut vec = Version(base).data();
-            vec.patch(self.0.borrow().difference.borrow());
-            vec
-        } else {
-            Vec::new()
-        }
+    pub fn data(&self) -> Pin<Box<dyn '_ + Sync + Future<Output = Vec<u8>>>> {
+        Box::pin(async {
+            if let Some(base) = self.0.read().await.base.upgrade() {
+                let mut vec = Version(base).data().await;
+                vec.patch(self.0.read().await.difference.borrow());
+                vec
+            } else {
+                Vec::new()
+            }
+        })
     }
 
     /// Deletes given version and all its children from the version tree.
@@ -258,17 +265,15 @@ impl Version {
     pub async fn delete(&mut self, database: &Database) -> sqlx::Result<()> {
         self.delete_private(database).await?;
 
-        if let Some(base) = self.0.borrow().base.upgrade() {
-            let children = &mut base.borrow_mut().children;
-            children.remove(
-                children.iter()
-                    .enumerate()
-                    .find(|(_, version)| {
-                        version.0.borrow().id == self.0.borrow().id
-                    })
-                    .unwrap()
-                    .0
-            );
+        if let Some(base) = self.0.read().await.base.upgrade() {
+            let children = &mut base.write().await.children;
+            let mut found = None;
+            for (index, version) in children.iter().enumerate() {
+                if version.0.read().await.id == self.0.read().await.id {
+                    found = Some(index);
+                }
+            }
+            children.remove(found.unwrap());
         }
 
         Ok(())
@@ -279,20 +284,20 @@ impl Version {
         database: &'a Database,
     ) -> Pin<Box<dyn 'a + Future<Output = sqlx::Result<()>>>> {
         Box::pin(async {
-            for child in &mut self.0.borrow_mut().children {
+            for child in &mut self.0.write().await.children {
                 child.delete_private(database).await?;
             }
 
             sqlx::query("DELETE FROM deletions WHERE id = ?")
-                .bind(self.0.borrow().id)
+                .bind(self.0.read().await.id)
                 .execute(&database.pool)
                 .await?;
             sqlx::query("DELETE FROM insertions WHERE id = ?")
-                .bind(self.0.borrow().id)
+                .bind(self.0.read().await.id)
                 .execute(&database.pool)
                 .await?;
             sqlx::query("DELETE FROM versions WHERE id = ?")
-                .bind(self.0.borrow().id)
+                .bind(self.0.read().await.id)
                 .execute(&database.pool)
                 .await?;
 
@@ -306,8 +311,8 @@ impl Version {
     ///
     /// This method returns an error if an IO error occurs while trying to write
     /// into the file.
-    pub fn rollback(&self, database: &Database) -> io::Result<()> {
-        File::create(&database.path)?.write(&self.data())?;
+    pub async fn rollback(&self, database: &Database) -> io::Result<()> {
+        File::create(&database.path)?.write(&self.data().await)?;
         Ok(())
     }
 
@@ -324,11 +329,11 @@ impl Version {
     ) -> sqlx::Result<()> {
         sqlx::query("UPDATE versions SET name = ? WHERE id = ?")
             .bind(&name)
-            .bind(self.0.borrow().id)
+            .bind(self.0.read().await.id)
             .execute(&database.pool)
             .await?;
 
-        self.0.borrow_mut().name = name;
+        self.0.write().await.name = name;
 
         Ok(())
     }
@@ -346,12 +351,12 @@ impl Version {
             INSERT INTO versions(bid, name, date)
             VALUES(?, ?, datetime(\"now\", \"localtime\"))
             RETURNING id, name, date
-        ").bind(self.0.borrow().id)
+        ").bind(self.0.read().await.id)
             .bind(DEFAULT_VERSION_NAME)
             .fetch_one(&database.pool)
             .await?;
 
-        let old = self.data();
+        let old = self.data().await;
         let mut new = Vec::new();
         File::open(&database.path)?.read_to_end(&mut new)?;
 
@@ -411,33 +416,35 @@ impl Version {
 
         let info = VersionInfo {
             id,
-            base: Rc::downgrade(&self.0),
+            base: Arc::downgrade(&self.0),
             name,
             date,
             difference,
             children: Vec::new(),
         };
 
-        self.0.borrow_mut().children.push(Version(Rc::new(RefCell::new(info))));
+        self.0.write().await.children.push(
+            Version(Arc::new(RwLock::new(info))),
+        );
 
         Ok(())
     }
 
     /// Returns ID of the version.
-    pub fn id(&self) -> u32 {
-        self.0.borrow().id
+    pub async fn id(&self) -> u32 {
+        self.0.read().await.id
     }
 
     /// Returns parent version of `self`. Returns [`None`] if there is none.
     ///
     /// [`None`]: None
-    pub fn base(&self) -> Option<Version> {
-        self.0.borrow().base.upgrade().map(|info| Version(info))
+    pub async fn base(&self) -> Option<Version> {
+        self.0.read().await.base.upgrade().map(|info| Version(info))
     }
 
     /// Returns name of the version.
-    pub fn name(&self) -> String {
-        self.0.borrow().name.clone()
+    pub async fn name(&self) -> String {
+        self.0.read().await.name.clone()
     }
 
     /// Returns date when the version was commited.
@@ -446,22 +453,22 @@ impl Version {
     /// format it was stores in the database.
     ///
     /// [`String`]: String
-    pub fn date(&self) -> String {
-        self.0.borrow().date.clone()
+    pub async fn date(&self) -> String {
+        self.0.read().await.date.clone()
     }
 
     /// Returns number of deletions from the file in this version.
-    pub fn deletions(&self) -> usize {
-        self.0.borrow().difference.deletions.len()
+    pub async fn deletions(&self) -> usize {
+        self.0.read().await.difference.deletions.len()
     }
 
     /// Returns number of insertions into the file in this version.
-    pub fn insertions(&self) -> usize {
-        self.0.borrow().difference.insertions.len()
+    pub async fn insertions(&self) -> usize {
+        self.0.read().await.difference.insertions.len()
     }
 
     /// Returns all the children of the version.
-    pub fn children(&self) -> Vec<Version> {
-        self.0.borrow().children.clone()
+    pub async fn children(&self) -> Vec<Version> {
+        self.0.read().await.children.clone()
     }
 }
