@@ -250,7 +250,10 @@ impl Version {
         Ok(root.unwrap())
     }
 
-    fn set_database<'a>(&'a self, database: &'a Database) -> Pin<Box<dyn 'a + Sync + Future<Output = ()>>> {
+    fn set_database<'a>(
+        &'a self,
+        database: &'a Database,
+    ) -> Pin<Box<dyn 'a + Send + Sync + Future<Output = ()>>> {
         Box::pin(async move {
             self.0.write().await.database = Arc::downgrade(&database.0);
             for child in &self.0.read().await.children {
@@ -265,7 +268,9 @@ impl Version {
     /// it calculates contents of the file every time this method is called
     /// using differences contained in the database, so you should either cache
     /// contents yourself, or do not call this method very often.
-    pub fn data(&self) -> Pin<Box<dyn '_ + Sync + Future<Output = Vec<u8>>>> {
+    pub fn data(
+        &self,
+    ) -> Pin<Box<dyn '_ + Send + Sync + Future<Output = Vec<u8>>>> {
         Box::pin(async {
             if let Some(base) = self.0.read().await.base.upgrade() {
                 let mut vec = Version(base).data().await;
@@ -302,7 +307,7 @@ impl Version {
 
     fn delete_private(
         &self,
-    ) -> Pin<Box<dyn '_ + Future<Output = sqlx::Result<()>>>> {
+    ) -> Pin<Box<dyn '_ + Send + Future<Output = sqlx::Result<()>>>> {
         Box::pin(async {
             for child in &self.0.read().await.children {
                 child.delete_private().await?;
