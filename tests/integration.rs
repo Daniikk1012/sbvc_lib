@@ -27,13 +27,13 @@ async fn data() -> sqlx::Result<()> {
 
     let database = Database::new(FILE.into()).await?;
     fs::write(FILE, DATA_1)?;
-    database.versions().commit(&database).await?;
+    database.versions().commit().await?;
     assert_eq!(database.versions().children().await[0].data().await, DATA_1);
     database.close().await;
 
     let database = Database::new(FILE.into()).await?;
     fs::write(FILE, DATA_2)?;
-    database.versions().children().await[0].commit(&database).await?;
+    database.versions().children().await[0].commit().await?;
     assert_eq!(database.versions().children().await[0].data().await, DATA_1);
     assert_eq!(
         database.versions()
@@ -78,10 +78,10 @@ async fn delete() -> sqlx::Result<()> {
 
     let database = Database::new(FILE.into()).await?;
     fs::write(FILE, DATA_1)?;
-    database.versions().commit(&database).await?;
+    database.versions().commit().await?;
     fs::write(FILE, DATA_2)?;
-    database.versions().children().await[0].commit(&database).await?;
-    database.versions().children().await[0].delete(&database).await?;
+    database.versions().children().await[0].commit().await?;
+    database.versions().children().await[0].delete().await?;
     database.close().await;
 
     let database = Database::new(FILE.into()).await?;
@@ -105,10 +105,10 @@ async fn rollback() -> sqlx::Result<()> {
 
     let database = Database::new(FILE.into()).await?;
     fs::write(FILE, DATA_1)?;
-    database.versions().commit(&database).await?;
+    database.versions().commit().await?;
     fs::write(FILE, DATA_2)?;
-    database.versions().children().await[0].commit(&database).await?;
-    database.versions().children().await[0].rollback(&database).await?;
+    database.versions().children().await[0].commit().await?;
+    database.versions().children().await[0].rollback().await?;
     assert_eq!(fs::read(FILE)?, DATA_1);
     database.close().await;
 
@@ -127,7 +127,7 @@ async fn rename() -> sqlx::Result<()> {
     const NAME: &'static str = "new name";
 
     let database = Database::new(FILE.into()).await?;
-    database.versions().rename(&database, NAME.to_string()).await?;
+    database.versions().rename(NAME.to_string()).await?;
     assert_eq!(database.versions().name().await, NAME);
     database.close().await;
 

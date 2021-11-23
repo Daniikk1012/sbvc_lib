@@ -57,13 +57,15 @@ use tokio::sync::RwLock;
 const INIT_VERSION_NAME: &'static str = "init";
 const DEFAULT_VERSION_NAME: &'static str = "unnamed";
 
-/// A `struct` that represents the database file where the version tree is
-/// contained.
-pub struct Database {
+struct DatabaseInfo {
     path: PathBuf,
     pool: SqlitePool,
     versions: Version,
 }
+
+/// A `struct` that represents the database file where the version tree is
+/// contained.
+pub struct Database(Arc<DatabaseInfo>);
 
 impl Database {
     /// Constructs new [`Database`] from path to file version of which has to be
@@ -132,24 +134,32 @@ impl Database {
 
         path.set_extension("");
 
-        Ok(Database { path, pool, versions })
+        let database = Database(Arc::new(DatabaseInfo {
+            path,
+            pool,
+            versions,
+        }));
+
+        database.versions().set_database(&database).await;
+
+        Ok(database)
     }
 
     /// Closes all the connections to the database in the pool.
     pub async fn close(self) {
-        self.pool.close().await;
+        self.0.pool.close().await;
     }
 
     /// Returns path to file version of which is being controlled.
     pub fn path(&self) -> PathBuf {
-        self.path.clone()
+        self.0.path.clone()
     }
 
     /// Returns the root [`Version`].
     ///
     /// [`Version`]: Version
     pub fn versions(&self) -> Version {
-        self.versions.clone()
+        self.0.versions.clone()
     }
 }
 
@@ -160,6 +170,7 @@ struct VersionInfo {
     date: String,
     difference: OwnedDifference<u8>,
     children: Vec<Version>,
+    database: Weak<DatabaseInfo>,
 }
 
 /// A `struct` that represents a single commit in the version tree. It uses
@@ -212,6 +223,7 @@ impl Version {
                             difference:
                                 OwnedDifference::new(deletions, insertions),
                             children: Vec::new(),
+                            database: Weak::new(),
                         },
                         bid
                     )))
@@ -238,6 +250,15 @@ impl Version {
         Ok(root.unwrap())
     }
 
+    fn set_database<'a>(&'a self, database: &'a Database) -> Pin<Box<dyn 'a + Sync + Future<Output = ()>>> {
+        Box::pin(async move {
+            self.0.write().await.database = Arc::downgrade(&database.0);
+            for child in &self.0.read().await.children {
+                child.set_database(database).await;
+            }
+        })
+    }
+
     /// Returns contents of the controlled file in given version.
     ///
     /// This method does not cache anything or use any cached values. Instead,
@@ -262,8 +283,8 @@ impl Version {
     ///
     /// This method returns an error if error happens while deleting records
     /// from the database.
-    pub async fn delete(&mut self, database: &Database) -> sqlx::Result<()> {
-        self.delete_private(database).await?;
+    pub async fn delete(&self) -> sqlx::Result<()> {
+        self.delete_private().await?;
 
         if let Some(base) = self.0.read().await.base.upgrade() {
             let children = &mut base.write().await.children;
@@ -279,26 +300,25 @@ impl Version {
         Ok(())
     }
 
-    fn delete_private<'a>(
-        &'a mut self,
-        database: &'a Database,
-    ) -> Pin<Box<dyn 'a + Future<Output = sqlx::Result<()>>>> {
+    fn delete_private(
+        &self,
+    ) -> Pin<Box<dyn '_ + Future<Output = sqlx::Result<()>>>> {
         Box::pin(async {
-            for child in &mut self.0.write().await.children {
-                child.delete_private(database).await?;
+            for child in &self.0.read().await.children {
+                child.delete_private().await?;
             }
 
             sqlx::query("DELETE FROM deletions WHERE id = ?")
                 .bind(self.0.read().await.id)
-                .execute(&database.pool)
+                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
                 .await?;
             sqlx::query("DELETE FROM insertions WHERE id = ?")
                 .bind(self.0.read().await.id)
-                .execute(&database.pool)
+                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
                 .await?;
             sqlx::query("DELETE FROM versions WHERE id = ?")
                 .bind(self.0.read().await.id)
-                .execute(&database.pool)
+                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
                 .await?;
 
             Ok(())
@@ -311,8 +331,9 @@ impl Version {
     ///
     /// This method returns an error if an IO error occurs while trying to write
     /// into the file.
-    pub async fn rollback(&self, database: &Database) -> io::Result<()> {
-        File::create(&database.path)?.write(&self.data().await)?;
+    pub async fn rollback(&self) -> io::Result<()> {
+        File::create(&self.0.read().await.database.upgrade().unwrap().path)?
+            .write(&self.data().await)?;
         Ok(())
     }
 
@@ -322,15 +343,11 @@ impl Version {
     ///
     /// This method returns an error if an error occurs while trying to update
     /// values in the database.
-    pub async fn rename(
-        &mut self,
-        database: &Database,
-        name: String,
-    ) -> sqlx::Result<()> {
+    pub async fn rename(&self, name: String) -> sqlx::Result<()> {
         sqlx::query("UPDATE versions SET name = ? WHERE id = ?")
             .bind(&name)
             .bind(self.0.read().await.id)
-            .execute(&database.pool)
+            .execute(&self.0.read().await.database.upgrade().unwrap().pool)
             .await?;
 
         self.0.write().await.name = name;
@@ -346,19 +363,20 @@ impl Version {
     ///
     /// This method returns an error if an error occurs while trying to insert
     /// values into the database.
-    pub async fn commit(&self, database: &Database) -> sqlx::Result<()> {
+    pub async fn commit(&self) -> sqlx::Result<()> {
         let (id, name, date) = sqlx::query_as("
             INSERT INTO versions(bid, name, date)
             VALUES(?, ?, datetime(\"now\", \"localtime\"))
             RETURNING id, name, date
         ").bind(self.0.read().await.id)
             .bind(DEFAULT_VERSION_NAME)
-            .fetch_one(&database.pool)
+            .fetch_one(&self.0.read().await.database.upgrade().unwrap().pool)
             .await?;
 
         let old = self.data().await;
         let mut new = Vec::new();
-        File::open(&database.path)?.read_to_end(&mut new)?;
+        File::open(&self.0.read().await.database.upgrade().unwrap().path)?
+            .read_to_end(&mut new)?;
 
         let mut sqrt = (old.len() as f32).sqrt() as usize;
         if sqrt == 0 {
@@ -400,7 +418,7 @@ impl Version {
             ).bind(id)
                 .bind(*start as u32)
                 .bind(*end as u32)
-                .execute(&database.pool)
+                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
                 .await?;
         }
 
@@ -410,7 +428,7 @@ impl Version {
             ).bind(id)
                 .bind(*start as u32)
                 .bind(data)
-                .execute(&database.pool)
+                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
                 .await?;
         }
 
@@ -421,6 +439,7 @@ impl Version {
             date,
             difference,
             children: Vec::new(),
+            database: self.0.read().await.database.clone(),
         };
 
         self.0.write().await.children.push(
