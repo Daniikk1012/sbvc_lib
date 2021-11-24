@@ -145,6 +145,11 @@ impl Database {
         Ok(database)
     }
 
+    /// Creates a new weak pointer to `self`.
+    pub fn downgrade(&self) -> DatabaseWeak {
+        DatabaseWeak(Arc::downgrade(&self.0))
+    }
+
     /// Closes all the connections to the database in the pool.
     pub async fn close(self) {
         self.0.pool.close().await;
@@ -163,14 +168,42 @@ impl Database {
     }
 }
 
+/// A weak pointer to [`Database`].
+///
+/// [`Database`]: Database
+#[derive(Clone)]
+pub struct DatabaseWeak(Weak<DatabaseInfo>);
+
+impl DatabaseWeak {
+    /// A convinience method that constructs a [`DatabaseWeak`] that does not
+    /// point to anything.
+    ///
+    /// Calling [`upgrade`] method on the returned value will result in
+    /// [`None`].
+    ///
+    /// [`DatabaseWeak`]: DatabaseWeak
+    /// [`upgrade`]: DatabaseWeak::upgrade
+    /// [`None`]: None
+    pub fn new() -> DatabaseWeak {
+        DatabaseWeak(Weak::new())
+    }
+
+    /// Attempts to upgrade value in `self` into a [`Database`].
+    ///
+    /// [`Database`]: Database
+    pub fn upgrade(&self) -> Option<Database> {
+        self.0.upgrade().map(|info| Database(info))
+    }
+}
+
 struct VersionInfo {
     id: u32,
-    base: Weak<RwLock<VersionInfo>>,
+    base: VersionWeak,
     name: String,
     date: String,
     difference: OwnedDifference<u8>,
     children: Vec<Version>,
-    database: Weak<DatabaseInfo>,
+    database: DatabaseWeak,
 }
 
 /// A `struct` that represents a single commit in the version tree. It uses
@@ -217,13 +250,13 @@ impl Version {
                     Ok(Some((
                         VersionInfo {
                             id,
-                            base: Weak::new(),
+                            base: VersionWeak::new(),
                             name,
                             date,
                             difference:
                                 OwnedDifference::new(deletions, insertions),
                             children: Vec::new(),
-                            database: Weak::new(),
+                            database: DatabaseWeak::new(),
                         },
                         bid
                     )))
@@ -232,22 +265,22 @@ impl Version {
         let mut map = HashMap::new();
 
         stream.try_for_each(|(info, bid)| {
-            map.insert(info.id, (Arc::new(RwLock::new(info)), bid));
+            map.insert(info.id, (Version(Arc::new(RwLock::new(info))), bid));
             future::ready(Ok(()))
         }).await?;
 
-        let mut root = None;
+        let mut root = VersionWeak::new();
 
-        for (info, bid) in map.values() {
+        for (version, bid) in map.values() {
             if let Some(bid) = bid {
-                map[bid].0.write().await.children.push(Version(info.clone()));
-                info.write().await.base = Arc::downgrade(&map[bid].0);
+                map[bid].0.0.write().await.children.push(version.clone());
+                version.0.write().await.base = map[bid].0.downgrade();
             } else {
-                root = Some(Version(info.clone()));
+                root = version.downgrade();
             }
         }
 
-        Ok(root.unwrap())
+        Ok(root.upgrade().unwrap())
     }
 
     fn set_database<'a>(
@@ -255,7 +288,7 @@ impl Version {
         database: &'a Database,
     ) -> Pin<Box<dyn 'a + Send + Sync + Future<Output = ()>>> {
         Box::pin(async move {
-            self.0.write().await.database = Arc::downgrade(&database.0);
+            self.0.write().await.database = database.downgrade();
             for child in &self.0.read().await.children {
                 child.set_database(database).await;
             }
@@ -273,7 +306,7 @@ impl Version {
     ) -> Pin<Box<dyn '_ + Send + Sync + Future<Output = Vec<u8>>>> {
         Box::pin(async {
             if let Some(base) = self.0.read().await.base.upgrade() {
-                let mut vec = Version(base).data().await;
+                let mut vec = base.data().await;
                 vec.patch(self.0.read().await.difference.borrow());
                 vec
             } else {
@@ -292,7 +325,7 @@ impl Version {
         self.delete_private().await?;
 
         if let Some(base) = self.0.read().await.base.upgrade() {
-            let children = &mut base.write().await.children;
+            let children = &mut base.0.write().await.children;
             let mut found = None;
             for (index, version) in children.iter().enumerate() {
                 if version.0.read().await.id == self.0.read().await.id {
@@ -315,15 +348,21 @@ impl Version {
 
             sqlx::query("DELETE FROM deletions WHERE id = ?")
                 .bind(self.0.read().await.id)
-                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
+                .execute(
+                    &self.0.read().await.database.upgrade().unwrap().0.pool,
+                )
                 .await?;
             sqlx::query("DELETE FROM insertions WHERE id = ?")
                 .bind(self.0.read().await.id)
-                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
+                .execute(
+                    &self.0.read().await.database.upgrade().unwrap().0.pool,
+                )
                 .await?;
             sqlx::query("DELETE FROM versions WHERE id = ?")
                 .bind(self.0.read().await.id)
-                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
+                .execute(
+                    &self.0.read().await.database.upgrade().unwrap().0.pool,
+                )
                 .await?;
 
             Ok(())
@@ -337,7 +376,7 @@ impl Version {
     /// This method returns an error if an IO error occurs while trying to write
     /// into the file.
     pub async fn rollback(&self) -> io::Result<()> {
-        File::create(&self.0.read().await.database.upgrade().unwrap().path)?
+        File::create(&self.0.read().await.database.upgrade().unwrap().0.path)?
             .write(&self.data().await)?;
         Ok(())
     }
@@ -352,7 +391,7 @@ impl Version {
         sqlx::query("UPDATE versions SET name = ? WHERE id = ?")
             .bind(&name)
             .bind(self.0.read().await.id)
-            .execute(&self.0.read().await.database.upgrade().unwrap().pool)
+            .execute(&self.0.read().await.database.upgrade().unwrap().0.pool)
             .await?;
 
         self.0.write().await.name = name;
@@ -375,12 +414,12 @@ impl Version {
             RETURNING id, name, date
         ").bind(self.0.read().await.id)
             .bind(DEFAULT_VERSION_NAME)
-            .fetch_one(&self.0.read().await.database.upgrade().unwrap().pool)
+            .fetch_one(&self.0.read().await.database.upgrade().unwrap().0.pool)
             .await?;
 
         let old = self.data().await;
         let mut new = Vec::new();
-        File::open(&self.0.read().await.database.upgrade().unwrap().path)?
+        File::open(&self.0.read().await.database.upgrade().unwrap().0.path)?
             .read_to_end(&mut new)?;
 
         let mut sqrt = (old.len() as f32).sqrt() as usize;
@@ -392,7 +431,7 @@ impl Version {
         let new: Vec<_> = new.chunks(sqrt).collect();
 
         let mut difference = new.diff(&old);
-        
+
         for Deletion { start, end } in &mut difference.deletions {
             let new_start = *start * sqrt;
             *end = new_start
@@ -423,7 +462,9 @@ impl Version {
             ).bind(id)
                 .bind(*start as u32)
                 .bind(*end as u32)
-                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
+                .execute(
+                    &self.0.read().await.database.upgrade().unwrap().0.pool,
+                )
                 .await?;
         }
 
@@ -433,13 +474,15 @@ impl Version {
             ).bind(id)
                 .bind(*start as u32)
                 .bind(data)
-                .execute(&self.0.read().await.database.upgrade().unwrap().pool)
+                .execute(
+                    &self.0.read().await.database.upgrade().unwrap().0.pool,
+                )
                 .await?;
         }
 
         let info = VersionInfo {
             id,
-            base: Arc::downgrade(&self.0),
+            base: self.downgrade(),
             name,
             date,
             difference,
@@ -454,6 +497,11 @@ impl Version {
         Ok(())
     }
 
+    /// Creates a new weak pointer to `self`.
+    pub fn downgrade(&self) -> VersionWeak {
+        VersionWeak(Arc::downgrade(&self.0))
+    }
+
     /// Returns ID of the version.
     pub async fn id(&self) -> u32 {
         self.0.read().await.id
@@ -463,7 +511,7 @@ impl Version {
     ///
     /// [`None`]: None
     pub async fn base(&self) -> Option<Version> {
-        self.0.read().await.base.upgrade().map(|info| Version(info))
+        self.0.read().await.base.upgrade()
     }
 
     /// Returns name of the version.
@@ -494,5 +542,33 @@ impl Version {
     /// Returns all the children of the version.
     pub async fn children(&self) -> Vec<Version> {
         self.0.read().await.children.clone()
+    }
+}
+
+/// A weak pointer to [`Version`].
+///
+/// [`Version`]: Version
+#[derive(Clone)]
+pub struct VersionWeak(Weak<RwLock<VersionInfo>>);
+
+impl VersionWeak {
+    /// A convinience method that constructs a [`VersionWeak`] that does not
+    /// point to anything.
+    ///
+    /// Calling [`upgrade`] method on the returned value will result in
+    /// [`None`].
+    ///
+    /// [`VersionWeak`]: VersionWeak
+    /// [`upgrade`]: VersionWeak::upgrade
+    /// [`None`]: None
+    pub fn new() -> VersionWeak {
+        VersionWeak(Weak::new())
+    }
+
+    /// Attempts to upgrade value in `self` into a [`Version`].
+    ///
+    /// [`Version`]: Version
+    pub fn upgrade(&self) -> Option<Version> {
+        self.0.upgrade().map(|info| Version(info))
     }
 }
