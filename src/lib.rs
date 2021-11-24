@@ -95,25 +95,25 @@ impl Database {
         ).await?;
 
         sqlx::query("CREATE TABLE IF NOT EXISTS versions(
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY NOT NULL,
             bid INTEGER,
-            name TEXT,
-            date TIMESTAMP,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL,
             FOREIGN KEY(bid) REFERENCES versions(id)
         )").execute(&pool).await?;
 
         sqlx::query("CREATE TABLE IF NOT EXISTS deletions(
-            id INTEGER,
-            start INTEGER,
-            end INTEGER,
+            id INTEGER NOT NULL,
+            start INTEGER NOT NULL,
+            end INTEGER NOT NULL,
             PRIMARY KEY(id, start),
             FOREIGN KEY(id) REFERENCES versions(id)
         )").execute(&pool).await?;
 
         sqlx::query("CREATE TABLE IF NOT EXISTS insertions(
-            id INTEGER,
-            start INTEGER,
-            data BLOB,
+            id INTEGER NOT NULL,
+            start INTEGER NOT NULL,
+            data BLOB NOT NULL,
             PRIMARY KEY(id, start),
             FOREIGN KEY(id) REFERENCES versions(id)
         )").execute(&pool).await?;
