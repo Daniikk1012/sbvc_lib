@@ -423,18 +423,15 @@ impl Version {
         File::open(&self.0.read().await.database.upgrade().unwrap().0.path)?
             .read_to_end(&mut new)?;
 
-        let mut sqrt = (old.len() as f32).sqrt() as usize;
-        if sqrt == 0 {
-            sqrt = 1;
-        }
+        let chunk_size = (old.len().min(new.len()) / 1_000).max(1);
 
-        let old = old.chunks(sqrt).collect();
-        let new: Vec<_> = new.chunks(sqrt).collect();
+        let old = old.chunks(chunk_size).collect();
+        let new: Vec<_> = new.chunks(chunk_size).collect();
 
         let mut difference = new.diff(&old);
 
         for Deletion { start, end } in &mut difference.deletions {
-            let new_start = *start * sqrt;
+            let new_start = *start * chunk_size;
             *end = new_start
                 + old[*start..*end].iter()
                     .fold(0, |result, chunk| result + chunk.len());
@@ -446,7 +443,7 @@ impl Version {
             difference.insertions.into_iter()
                 .map(|insertion| {
                     OwnedInsertion::new(
-                        insertion.start * sqrt,
+                        insertion.start * chunk_size,
                         insertion.data.into_iter()
                             .map(|slice| slice.iter())
                             .flatten()
