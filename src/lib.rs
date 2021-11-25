@@ -45,7 +45,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use futures::prelude::*;
+use futures::{join, prelude::*};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use wgdiff::{Deletion, Diff, OwnedDifference, OwnedInsertion, Patch};
 
@@ -232,8 +232,7 @@ impl Version {
                         .try_filter_map(|(start, end): (u32, u32)| async move {
                             Ok(Some(start as usize..end as usize))
                         })
-                        .try_collect()
-                        .await?;
+                        .try_collect();
 
                     let insertions =
                         sqlx::query_as("
@@ -245,8 +244,11 @@ impl Version {
                         .try_filter_map(|(start, data): (u32, _)| async move {
                             Ok(Some(OwnedInsertion::new(start as usize, data)))
                         })
-                        .try_collect()
-                        .await?;
+                        .try_collect();
+
+                    let (deletions, insertions) = join!(deletions, insertions);
+                    let deletions = deletions?;
+                    let insertions = insertions?;
 
                     Ok(Some((
                         VersionInfo {
@@ -265,7 +267,7 @@ impl Version {
 
         let mut map = HashMap::new();
 
-        stream.try_for_each(|(info, bid)| {
+        stream.try_for_each_concurrent(None, |(info, bid)| {
             map.insert(info.id, (Version(Arc::new(RwLock::new(info))), bid));
             future::ready(Ok(()))
         }).await?;
@@ -274,8 +276,13 @@ impl Version {
 
         for (version, bid) in map.values() {
             if let Some(bid) = bid {
-                map[bid].0.0.write().await.children.push(version.clone());
-                version.0.write().await.base = map[bid].0.downgrade();
+                let parent = async {
+                    map[bid].0.0.write().await.children.push(version.clone());
+                };
+                let child = async {
+                    version.0.write().await.base = map[bid].0.downgrade();
+                };
+                join!(parent, child);
             } else {
                 root = version.downgrade();
             }
@@ -290,6 +297,7 @@ impl Version {
     ) -> Pin<Box<dyn 'a + Send + Sync + Future<Output = ()>>> {
         Box::pin(async move {
             self.0.write().await.database = database.downgrade();
+
             for child in &self.0.read().await.children {
                 child.set_database(database).await;
             }
@@ -306,9 +314,10 @@ impl Version {
         &self,
     ) -> Pin<Box<dyn '_ + Send + Sync + Future<Output = Vec<u8>>>> {
         Box::pin(async {
-            if let Some(base) = self.0.read().await.base.upgrade() {
+            let read = self.0.read().await;
+            if let Some(base) = read.base.upgrade() {
                 let mut vec = base.data().await;
-                vec.patch(self.0.read().await.difference.borrow());
+                vec.patch(read.difference.borrow());
                 vec
             } else {
                 Vec::new()
@@ -323,18 +332,26 @@ impl Version {
     /// This method returns an error if error happens while deleting records
     /// from the database.
     pub async fn delete(&self) -> sqlx::Result<()> {
-        self.delete_private().await?;
+        let parent = async {
+            let read = self.0.read().await;
 
-        if let Some(base) = self.0.read().await.base.upgrade() {
-            let children = &mut base.0.write().await.children;
-            let mut found = None;
-            for (index, version) in children.iter().enumerate() {
-                if version.0.read().await.id == self.0.read().await.id {
-                    found = Some(index);
+            if let Some(base) = read.base.upgrade() {
+                let children = &mut base.0.write().await.children;
+                let mut found = None;
+                for (index, version) in children.iter().enumerate() {
+                    if version.0.read().await.id == read.id {
+                        found = Some(index);
+                        break;
+                    }
                 }
+                children.remove(found.unwrap());
             }
-            children.remove(found.unwrap());
-        }
+        };
+
+        let children = self.delete_private();
+
+        let (_, children) = join!(parent, children);
+        children?;
 
         Ok(())
     }
@@ -343,27 +360,34 @@ impl Version {
         &self,
     ) -> Pin<Box<dyn '_ + Send + Future<Output = sqlx::Result<()>>>> {
         Box::pin(async {
-            for child in &self.0.read().await.children {
-                child.delete_private().await?;
-            }
+            let read = self.0.read().await;
 
-            sqlx::query("DELETE FROM deletions WHERE id = ?")
-                .bind(self.0.read().await.id)
-                .execute(
-                    &self.0.read().await.database.upgrade().unwrap().0.pool,
-                )
-                .await?;
-            sqlx::query("DELETE FROM insertions WHERE id = ?")
-                .bind(self.0.read().await.id)
-                .execute(
-                    &self.0.read().await.database.upgrade().unwrap().0.pool,
-                )
-                .await?;
+            let children = async {
+                for child in &read.children {
+                    child.delete_private().await?;
+                }
+
+                Ok(())
+            };
+
+            let database = read.database.upgrade().unwrap();
+
+            let deletions = sqlx::query("DELETE FROM deletions WHERE id = ?")
+                .bind(read.id)
+                .execute(&database.0.pool);
+            let insertions = sqlx::query("DELETE FROM insertions WHERE id = ?")
+                .bind(read.id)
+                .execute(&database.0.pool);
+
+            let (children, deletions, insertions): (sqlx::Result<()>, _, _) =
+                join!(children, deletions, insertions);
+            children?;
+            deletions?;
+            insertions?;
+
             sqlx::query("DELETE FROM versions WHERE id = ?")
-                .bind(self.0.read().await.id)
-                .execute(
-                    &self.0.read().await.database.upgrade().unwrap().0.pool,
-                )
+                .bind(read.id)
+                .execute(&database.0.pool)
                 .await?;
 
             Ok(())
@@ -377,8 +401,12 @@ impl Version {
     /// This method returns an error if an IO error occurs while trying to write
     /// into the file.
     pub async fn rollback(&self) -> io::Result<()> {
-        File::create(&self.0.read().await.database.upgrade().unwrap().0.path)?
-            .write(&self.data().await)?;
+        let read = self.0.read();
+        let data = self.data();
+
+        let (read, data) = join!(read, data);
+
+        File::create(&read.database.upgrade().unwrap().0.path)?.write(&data)?;
         Ok(())
     }
 
@@ -389,11 +417,15 @@ impl Version {
     /// This method returns an error if an error occurs while trying to update
     /// values in the database.
     pub async fn rename(&self, name: String) -> sqlx::Result<()> {
+        let read = self.0.read().await;
+
         sqlx::query("UPDATE versions SET name = ? WHERE id = ?")
             .bind(&name)
-            .bind(self.0.read().await.id)
-            .execute(&self.0.read().await.database.upgrade().unwrap().0.pool)
+            .bind(read.id)
+            .execute(&read.database.upgrade().unwrap().0.pool)
             .await?;
+
+        drop(read);
 
         self.0.write().await.name = name;
 
@@ -409,18 +441,25 @@ impl Version {
     /// This method returns an error if an error occurs while trying to insert
     /// values into the database.
     pub async fn commit(&self) -> sqlx::Result<()> {
-        let (id, name, date) = sqlx::query_as("
+        let read = self.0.read().await;
+
+        let database = read.database.upgrade().unwrap();
+
+        let query = sqlx::query_as("
             INSERT INTO versions(bid, name, date)
             VALUES(?, ?, datetime(\"now\", \"localtime\"))
             RETURNING id, name, date
-        ").bind(self.0.read().await.id)
+        ").bind(read.id)
             .bind(DEFAULT_VERSION_NAME)
-            .fetch_one(&self.0.read().await.database.upgrade().unwrap().0.pool)
-            .await?;
+            .fetch_one(&database.0.pool);
 
-        let old = self.data().await;
+        let old = self.data();
+
+        let (query, old) = join!(query, old);
+        let (id, name, date) = query?;
+
         let mut new = Vec::new();
-        File::open(&self.0.read().await.database.upgrade().unwrap().0.path)?
+        File::open(&read.database.upgrade().unwrap().0.path)?
             .read_to_end(&mut new)?;
 
         let chunk_size = (old.len().min(new.len()) / 1_000).max(1);
@@ -454,29 +493,36 @@ impl Version {
                 .collect(),
         );
 
-        for Deletion { start, end } in &difference.deletions {
-            sqlx::query(
-                "INSERT INTO deletions(id, start, end) VALUES(?, ?, ?)",
-            ).bind(id)
-                .bind(*start as u32)
-                .bind(*end as u32)
-                .execute(
-                    &self.0.read().await.database.upgrade().unwrap().0.pool,
-                )
-                .await?;
-        }
+        let deletions = async {
+            for Deletion { start, end } in &difference.deletions {
+                sqlx::query(
+                    "INSERT INTO deletions(id, start, end) VALUES(?, ?, ?)",
+                ).bind(id)
+                    .bind(*start as u32)
+                    .bind(*end as u32)
+                    .execute(&database.0.pool)
+                    .await?;
+            }
+            Ok(())
+        };
 
-        for OwnedInsertion { start, data } in &difference.insertions {
-            sqlx::query(
-                "INSERT INTO insertions(id, start, data) VALUES(?, ?, ?)",
-            ).bind(id)
-                .bind(*start as u32)
-                .bind(data)
-                .execute(
-                    &self.0.read().await.database.upgrade().unwrap().0.pool,
-                )
-                .await?;
-        }
+        let insertions = async {
+            for OwnedInsertion { start, data } in &difference.insertions {
+                sqlx::query(
+                    "INSERT INTO insertions(id, start, data) VALUES(?, ?, ?)",
+                ).bind(id)
+                    .bind(*start as u32)
+                    .bind(data)
+                    .execute(&database.0.pool)
+                    .await?;
+            }
+            Ok(())
+        };
+
+        let (deletions, insertions): (sqlx::Result<()>, sqlx::Result<()>) =
+            join!(deletions, insertions);
+        deletions?;
+        insertions?;
 
         let info = VersionInfo {
             id,
@@ -485,8 +531,10 @@ impl Version {
             date,
             difference,
             children: Vec::new(),
-            database: self.0.read().await.database.clone(),
+            database: database.downgrade(),
         };
+
+        drop(read);
 
         self.0.write().await.children.push(
             Version(Arc::new(RwLock::new(info))),
