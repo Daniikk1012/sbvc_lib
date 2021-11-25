@@ -65,6 +65,7 @@ struct DatabaseInfo {
 
 /// A `struct` that represents the database file where the version tree is
 /// contained.
+#[derive(Clone)]
 pub struct Database(Arc<DatabaseInfo>);
 
 impl Database {
