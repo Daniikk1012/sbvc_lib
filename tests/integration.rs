@@ -2,7 +2,6 @@ use std::fs;
 
 use sbvc_lib::Database;
 
-#[cfg_attr(feature = "actix-rt", actix_rt::test)]
 #[cfg_attr(feature = "async-std", async_std::test)]
 #[cfg_attr(feature = "tokio", tokio::test)]
 async fn create() -> sqlx::Result<()> {
@@ -16,7 +15,6 @@ async fn create() -> sqlx::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "actix-rt", actix_rt::test)]
 #[cfg_attr(feature = "async-std", async_std::test)]
 #[cfg_attr(feature = "tokio", tokio::test)]
 async fn data() -> sqlx::Result<()> {
@@ -67,7 +65,6 @@ async fn data() -> sqlx::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "actix-rt", actix_rt::test)]
 #[cfg_attr(feature = "async-std", async_std::test)]
 #[cfg_attr(feature = "tokio", tokio::test)]
 async fn delete() -> sqlx::Result<()> {
@@ -94,7 +91,6 @@ async fn delete() -> sqlx::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "actix-rt", actix_rt::test)]
 #[cfg_attr(feature = "async-std", async_std::test)]
 #[cfg_attr(feature = "tokio", tokio::test)]
 async fn rollback() -> sqlx::Result<()> {
@@ -118,7 +114,6 @@ async fn rollback() -> sqlx::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "actix-rt", actix_rt::test)]
 #[cfg_attr(feature = "async-std", async_std::test)]
 #[cfg_attr(feature = "tokio", tokio::test)]
 async fn rename() -> sqlx::Result<()> {
