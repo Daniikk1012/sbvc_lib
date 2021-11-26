@@ -23,7 +23,7 @@
 //! ```toml
 //! [dependencies]
 //! sbvc_lib = {
-//!     version = "0.3",
+//!     version = "0.3.1",
 //!     default-features = false,
 //!     features = "runtime-tokio-native-tls",
 //! }
