@@ -11,7 +11,7 @@ async fn create() -> sqlx::Result<()> {
     Database::new(FILE.into()).await?.close().await;
 
     fs::remove_file(DATABASE)?;
-    
+
     Ok(())
 }
 
@@ -34,11 +34,7 @@ async fn data() -> sqlx::Result<()> {
     database.versions().children().await[0].commit().await?;
     assert_eq!(database.versions().children().await[0].data().await, DATA_1);
     assert_eq!(
-        database.versions()
-            .children()
-            .await[0]
-            .children()
-            .await[0]
+        database.versions().children().await[0].children().await[0]
             .data()
             .await,
         DATA_2,
@@ -48,11 +44,7 @@ async fn data() -> sqlx::Result<()> {
     let database = Database::new(FILE.into()).await?;
     assert_eq!(database.versions().children().await[0].data().await, DATA_1);
     assert_eq!(
-        database.versions()
-            .children()
-            .await[0]
-            .children()
-            .await[0]
+        database.versions().children().await[0].children().await[0]
             .data()
             .await,
         DATA_2,

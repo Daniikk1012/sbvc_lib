@@ -39,14 +39,16 @@
 //! [`Version`]: Version
 
 use std::{
-    collections::HashMap, fs::File,
+    collections::HashMap,
+    fs::File,
     io::{self, Read, Write},
-    path::PathBuf, pin::Pin,
+    path::PathBuf,
+    pin::Pin,
     sync::{Arc, Weak},
 };
 
 use futures::{join, prelude::*};
-use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use wgdiff::{Deletion, Diff, OwnedDifference, OwnedInsertion, Patch};
 
 #[cfg(feature = "async-std")]
@@ -90,56 +92,68 @@ impl Database {
         let mut path: PathBuf = path.into();
 
         let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true)
-        ).await?;
+            SqliteConnectOptions::new().filename(&path).create_if_missing(true),
+        )
+        .await?;
 
-        sqlx::query("CREATE TABLE IF NOT EXISTS versions(
-            id INTEGER PRIMARY KEY NOT NULL,
-            bid INTEGER,
-            name TEXT NOT NULL,
-            date TEXT NOT NULL,
-            FOREIGN KEY(bid) REFERENCES versions(id)
-        )").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS versions(
+                id INTEGER PRIMARY KEY NOT NULL,
+                bid INTEGER,
+                name TEXT NOT NULL,
+                date TEXT NOT NULL,
+                FOREIGN KEY(bid) REFERENCES versions(id)
+            )",
+        )
+        .execute(&pool)
+        .await?;
 
-        sqlx::query("CREATE TABLE IF NOT EXISTS deletions(
-            id INTEGER NOT NULL,
-            start INTEGER NOT NULL,
-            end INTEGER NOT NULL,
-            PRIMARY KEY(id, start),
-            FOREIGN KEY(id) REFERENCES versions(id)
-        )").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS deletions(
+                id INTEGER NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                PRIMARY KEY(id, start),
+                FOREIGN KEY(id) REFERENCES versions(id)
+            )",
+        )
+        .execute(&pool)
+        .await?;
 
-        sqlx::query("CREATE TABLE IF NOT EXISTS insertions(
-            id INTEGER NOT NULL,
-            start INTEGER NOT NULL,
-            data BLOB NOT NULL,
-            PRIMARY KEY(id, start),
-            FOREIGN KEY(id) REFERENCES versions(id)
-        )").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS insertions(
+                id INTEGER NOT NULL,
+                start INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY(id, start),
+                FOREIGN KEY(id) REFERENCES versions(id)
+            )",
+        )
+        .execute(&pool)
+        .await?;
 
         if sqlx::query_scalar::<_, u32>("SELECT COUNT() FROM versions")
             .fetch_one(&pool)
-            .await? == 0
+            .await?
+            == 0
         {
-            sqlx::query("INSERT INTO versions(name, date) VALUES(
-                ?,
-                datetime(\"now\", \"localtime\")
-            )").bind(INIT_VERSION_NAME)
-                .execute(&pool)
-                .await?;
+            sqlx::query(
+                "INSERT INTO versions(name, date) VALUES(
+                    ?,
+                    datetime(\"now\", \"localtime\")
+                )",
+            )
+            .bind(INIT_VERSION_NAME)
+            .execute(&pool)
+            .await?;
         }
 
         let versions = Version::new(&pool).await?;
 
         path.set_extension("");
 
-        let database = Database(Arc::new(DatabaseInfo {
-            path,
-            pool,
-            versions,
-        }));
+        let database =
+            Database(Arc::new(DatabaseInfo { path, pool, versions }));
 
         database.versions().set_database(&database).await;
 
@@ -218,33 +232,31 @@ pub struct Version(Arc<RwLock<VersionInfo>>);
 
 impl Version {
     async fn new(pool: &SqlitePool) -> sqlx::Result<Self> {
-        let stream =
-            sqlx::query_as("SELECT id, bid, name, date FROM versions")
-                .fetch(pool)
-                .try_filter_map(|(id, bid, name, date)| Box::pin(async move {
-                    let deletions =
-                        sqlx::query_as("
-                            SELECT start, end FROM deletions
-                            WHERE id = ? ORDER BY start
-                        ")
-                        .bind(id)
-                        .fetch(pool)
-                        .try_filter_map(|(start, end): (u32, u32)| async move {
-                            Ok(Some(start as usize..end as usize))
-                        })
-                        .try_collect();
+        let stream = sqlx::query_as("SELECT id, bid, name, date FROM versions")
+            .fetch(pool)
+            .try_filter_map(|(id, bid, name, date)| {
+                Box::pin(async move {
+                    let deletions = sqlx::query_as(
+                        "SELECT start, end FROM deletions
+                        WHERE id = ? ORDER BY start",
+                    )
+                    .bind(id)
+                    .fetch(pool)
+                    .try_filter_map(|(start, end): (u32, u32)| async move {
+                        Ok(Some(start as usize..end as usize))
+                    })
+                    .try_collect();
 
-                    let insertions =
-                        sqlx::query_as("
-                            SELECT start, data FROM insertions
-                            WHERE id = ? ORDER by start
-                        ")
-                        .bind(id)
-                        .fetch(pool)
-                        .try_filter_map(|(start, data): (u32, _)| async move {
-                            Ok(Some(OwnedInsertion::new(start as usize, data)))
-                        })
-                        .try_collect();
+                    let insertions = sqlx::query_as(
+                        "SELECT start, data FROM insertions
+                        WHERE id = ? ORDER by start",
+                    )
+                    .bind(id)
+                    .fetch(pool)
+                    .try_filter_map(|(start, data): (u32, _)| async move {
+                        Ok(Some(OwnedInsertion::new(start as usize, data)))
+                    })
+                    .try_collect();
 
                     let (deletions, insertions) = join!(deletions, insertions);
                     let deletions = deletions?;
@@ -256,28 +268,35 @@ impl Version {
                             base: VersionWeak::new(),
                             name,
                             date,
-                            difference:
-                                OwnedDifference::new(deletions, insertions),
+                            difference: OwnedDifference::new(
+                                deletions, insertions,
+                            ),
                             children: Vec::new(),
                             database: DatabaseWeak::new(),
                         },
-                        bid
+                        bid,
                     )))
-                }));
+                })
+            });
 
         let mut map = HashMap::new();
 
-        stream.try_for_each_concurrent(None, |(info, bid)| {
-            map.insert(info.id, (Version(Arc::new(RwLock::new(info))), bid));
-            future::ready(Ok(()))
-        }).await?;
+        stream
+            .try_for_each_concurrent(None, |(info, bid)| {
+                map.insert(
+                    info.id,
+                    (Version(Arc::new(RwLock::new(info))), bid),
+                );
+                future::ready(Ok(()))
+            })
+            .await?;
 
         let mut root = VersionWeak::new();
 
         for (version, bid) in map.values() {
             if let Some(bid) = bid {
                 let parent = async {
-                    map[bid].0.0.write().await.children.push(version.clone());
+                    map[bid].0 .0.write().await.children.push(version.clone());
                 };
                 let child = async {
                     version.0.write().await.base = map[bid].0.downgrade();
@@ -445,13 +464,14 @@ impl Version {
 
         let database = read.database.upgrade().unwrap();
 
-        let query = sqlx::query_as("
-            INSERT INTO versions(bid, name, date)
+        let query = sqlx::query_as(
+            "INSERT INTO versions(bid, name, date)
             VALUES(?, ?, datetime(\"now\", \"localtime\"))
-            RETURNING id, name, date
-        ").bind(read.id)
-            .bind(DEFAULT_VERSION_NAME)
-            .fetch_one(&database.0.pool);
+            RETURNING id, name, date",
+        )
+        .bind(read.id)
+        .bind(DEFAULT_VERSION_NAME)
+        .fetch_one(&database.0.pool);
 
         let old = self.data();
 
@@ -472,18 +492,23 @@ impl Version {
         for Deletion { start, end } in &mut difference.deletions {
             let new_start = *start * chunk_size;
             *end = new_start
-                + old[*start..*end].iter()
+                + old[*start..*end]
+                    .iter()
                     .fold(0, |result, chunk| result + chunk.len());
             *start = new_start;
         }
 
         let difference = OwnedDifference::new(
             difference.deletions,
-            difference.insertions.into_iter()
+            difference
+                .insertions
+                .into_iter()
                 .map(|insertion| {
                     OwnedInsertion::new(
                         insertion.start * chunk_size,
-                        insertion.data.into_iter()
+                        insertion
+                            .data
+                            .into_iter()
                             .map(|slice| slice.iter())
                             .flatten()
                             .map(Clone::clone)
@@ -497,11 +522,12 @@ impl Version {
             for Deletion { start, end } in &difference.deletions {
                 sqlx::query(
                     "INSERT INTO deletions(id, start, end) VALUES(?, ?, ?)",
-                ).bind(id)
-                    .bind(*start as u32)
-                    .bind(*end as u32)
-                    .execute(&database.0.pool)
-                    .await?;
+                )
+                .bind(id)
+                .bind(*start as u32)
+                .bind(*end as u32)
+                .execute(&database.0.pool)
+                .await?;
             }
             Ok(())
         };
@@ -510,11 +536,12 @@ impl Version {
             for OwnedInsertion { start, data } in &difference.insertions {
                 sqlx::query(
                     "INSERT INTO insertions(id, start, data) VALUES(?, ?, ?)",
-                ).bind(id)
-                    .bind(*start as u32)
-                    .bind(data)
-                    .execute(&database.0.pool)
-                    .await?;
+                )
+                .bind(id)
+                .bind(*start as u32)
+                .bind(data)
+                .execute(&database.0.pool)
+                .await?;
             }
             Ok(())
         };
@@ -536,9 +563,11 @@ impl Version {
 
         drop(read);
 
-        self.0.write().await.children.push(
-            Version(Arc::new(RwLock::new(info))),
-        );
+        self.0
+            .write()
+            .await
+            .children
+            .push(Version(Arc::new(RwLock::new(info))));
 
         Ok(())
     }
