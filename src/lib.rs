@@ -3,647 +3,536 @@
 //! This crate is backend for SBVC that provides useful and simple API to use
 //! in the frontend.
 //!
-//! # Get Started
-//!
-//! For this crate to work you have to choose one (and *only* one) of the
-//! following features:
-//!
-//! * `runtime-actix-native-tls`
-//! * `runtime-async-std-native-tls`
-//! * `runtime-tokio-native-tls`
-//! * `runtime-actix-rustls`
-//! * `runtime-async-std-rusttls`
-//! * `runtime-tokio-rustls`
-//!
-//! By default, `runtime-async-std-rustls` is chosen. If you want to use other
-//! runtime, disable default features of the crate.
-//!
-//! ## Example
-//!
-//! ```toml
-//! [dependencies]
-//! sbvc_lib = {
-//!     version = "0.3.1",
-//!     default-features = false,
-//!     features = "runtime-tokio-native-tls",
-//! }
-//! ```
+//! ## Get Started
 //!
 //! To get starting using the API, refer to documentations of following
 //! `struct`s:
 //!
-//! * [`Database`]
+//! * [`Sbvc`]
 //! * [`Version`]
 //!
-//! [`Database`]: Database
+//! [`Sbvc`]: Versions
 //! [`Version`]: Version
 
+#![deny(missing_docs)]
+
 use std::{
-    collections::HashMap,
-    fs::File,
-    io::{self, Read, Write},
-    path::PathBuf,
-    pin::Pin,
-    sync::{Arc, Weak},
+    error::Error,
+    ffi::OsStr,
+    fmt,
+    fmt::{Display, Formatter},
+    fs, io,
+    num::ParseIntError,
+    os::unix::prelude::OsStrExt,
+    path::{Path, PathBuf},
+    str::{self, Utf8Error},
+    time::{Duration, SystemTime},
 };
 
-use futures::{join, prelude::*};
-use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
-use wgdiff::{Deletion, Diff, OwnedDifference, OwnedInsertion, Patch};
+use nelf::{NelfIter, ToCell};
+use wgdiff::{
+    Deletion, Diff, Difference, OwnedDifference, OwnedInsertion, Patch,
+};
 
-#[cfg(feature = "async-std")]
-use async_std::sync::RwLock;
-#[cfg(feature = "tokio")]
-use tokio::sync::RwLock;
+const INIT_VERSION_NAME: &str = "init";
+const DEFAULT_VERSION_NAME: &str = "unnamed";
 
-const INIT_VERSION_NAME: &'static str = "init";
-const DEFAULT_VERSION_NAME: &'static str = "unnamed";
-
-struct DatabaseInfo {
-    path: PathBuf,
-    pool: SqlitePool,
-    versions: Version,
+/// An enum that represents any error that can occur while using this library.
+#[derive(Debug)]
+pub enum SbvcError {
+    /// An IO error.
+    Io(io::Error),
+    /// Invalid version tree file format error.
+    ///
+    /// Occurs when something is missing from the version tree file. Contains
+    /// a string describing the error.
+    InvalidFormat(String),
+    /// UTF-8 error.
+    Utf8(Utf8Error),
+    /// Integer parse error.
+    Parse(ParseIntError),
+    /// Version not found error.
+    ///
+    /// Contains the index of the version that was not found.
+    VersionNotFound(u32),
 }
 
-/// A `struct` that represents the database file where the version tree is
-/// contained.
-#[derive(Clone)]
-pub struct Database(Arc<DatabaseInfo>);
+impl From<io::Error> for SbvcError {
+    fn from(error: io::Error) -> Self {
+        SbvcError::Io(error)
+    }
+}
 
-impl Database {
-    /// Constructs new [`Database`] from path to file version of which has to be
-    /// controlled.
-    ///
-    /// This method creates `{path}.db` database file if it does not exist.
-    ///
-    /// To close the database, use [`close`] method.
+impl From<Utf8Error> for SbvcError {
+    fn from(error: Utf8Error) -> Self {
+        SbvcError::Utf8(error)
+    }
+}
+
+impl From<ParseIntError> for SbvcError {
+    fn from(error: ParseIntError) -> Self {
+        SbvcError::Parse(error)
+    }
+}
+
+impl Display for SbvcError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            SbvcError::Io(error) => write!(f, "SBVC IO Error: {}", error),
+            SbvcError::InvalidFormat(error) => {
+                write!(f, "SBVC Invalid Format Error: {}", error)
+            }
+            SbvcError::Utf8(error) => write!(f, "SBVC UTF-8 Error: {}", error),
+            SbvcError::Parse(error) => write!(f, "SBVC Parse Error: {}", error),
+            SbvcError::VersionNotFound(id) => {
+                write!(f, "SBVC Error: Version with ID {} not nound", id)
+            }
+        }
+    }
+}
+
+impl Error for SbvcError {}
+
+/// The [`Result`] type for this crate.
+///
+/// [`Result`]: Result
+pub type SbvcResult<T> = Result<T, SbvcError>;
+
+/// A struct that represents the file where the version tree is contained.
+#[derive(Debug, Clone)]
+pub struct Sbvc {
+    path: PathBuf,
+    file: PathBuf,
+    current: usize,
+    next: u32,
+    versions: Vec<Version>,
+}
+
+impl Sbvc {
+    /// Creates a new [`Sbvc`] instance and creates the version tree file.
     ///
     /// # Errors
     ///
-    /// This method will return an error if anything goes wrong while connecting
-    /// to the database (Including creating a file and wrongly designed database
-    /// file already existing with the provided name)
+    /// This method will return an error if an IO error occurs.
     ///
-    /// [`Database`]: Database
-    /// [`close`]: Database::close
-    pub async fn new(path: PathBuf) -> sqlx::Result<Self> {
-        let mut path = path.into_os_string();
-        path.push(".db");
-        let mut path: PathBuf = path.into();
+    /// [`Sbvc`]: Sbvc
+    pub fn new(path: PathBuf, file: PathBuf) -> SbvcResult<Self> {
+        let sbvc = Sbvc {
+            path,
+            file,
+            current: 0,
+            next: 1,
+            versions: vec![Version {
+                id: 0,
+                base: 0,
+                name: INIT_VERSION_NAME.to_string(),
+                date: SystemTime::now(),
+                difference: OwnedDifference::empty(),
+            }],
+        };
+        sbvc.write()?;
+        Ok(sbvc)
+    }
 
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new().filename(&path).create_if_missing(true),
-        )
-        .await?;
+    /// Constructs a [`Sbvc`] instance from path to file containing version
+    /// tree of a file.
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if an IO error or parsing error occurs.
+    ///
+    /// [`Sbvc`]: Sbvc
+    pub fn open(path: PathBuf) -> SbvcResult<Self> {
+        let source = fs::read(&path)?;
+        let mut iter = NelfIter::from_string(&source);
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS versions(
-                id INTEGER PRIMARY KEY NOT NULL,
-                bid INTEGER,
-                name TEXT NOT NULL,
-                date TEXT NOT NULL,
-                FOREIGN KEY(bid) REFERENCES versions(id)
-            )",
-        )
-        .execute(&pool)
-        .await?;
+        let file = OsStr::from_bytes(iter.next().ok_or_else(|| {
+            SbvcError::InvalidFormat("Expected filename".to_string())
+        })?)
+        .into();
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS deletions(
-                id INTEGER NOT NULL,
-                start INTEGER NOT NULL,
-                end INTEGER NOT NULL,
-                PRIMARY KEY(id, start),
-                FOREIGN KEY(id) REFERENCES versions(id)
-            )",
-        )
-        .execute(&pool)
-        .await?;
+        let current_id = str::from_utf8(iter.next().ok_or_else(|| {
+            SbvcError::InvalidFormat("Expected current version ID".to_string())
+        })?)?
+        .parse()?;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS insertions(
-                id INTEGER NOT NULL,
-                start INTEGER NOT NULL,
-                data BLOB NOT NULL,
-                PRIMARY KEY(id, start),
-                FOREIGN KEY(id) REFERENCES versions(id)
-            )",
-        )
-        .execute(&pool)
-        .await?;
+        let next = str::from_utf8(iter.next().ok_or_else(|| {
+            SbvcError::InvalidFormat("Expected next version ID".to_string())
+        })?)?
+        .parse()?;
 
-        if sqlx::query_scalar::<_, u32>("SELECT COUNT() FROM versions")
-            .fetch_one(&pool)
-            .await?
-            == 0
-        {
-            sqlx::query(
-                "INSERT INTO versions(name, date) VALUES(
-                    ?,
-                    datetime(\"now\", \"localtime\")
-                )",
-            )
-            .bind(INIT_VERSION_NAME)
-            .execute(&pool)
-            .await?;
+        let mut versions = Vec::new();
+
+        for version in NelfIter::from_string(iter.next().ok_or_else(|| {
+            SbvcError::InvalidFormat("Expected list of versions".to_string())
+        })?)
+        .map(|source| -> SbvcResult<Version> {
+            let mut iter = NelfIter::from_string(source);
+
+            let id = str::from_utf8(iter.next().ok_or_else(|| {
+                SbvcError::InvalidFormat("Expected version id".to_string())
+            })?)?
+            .parse()?;
+
+            let base = str::from_utf8(iter.next().ok_or_else(|| {
+                SbvcError::InvalidFormat("Expected base version id".to_string())
+            })?)?
+            .parse()?;
+
+            let mut meta =
+                NelfIter::from_string(iter.next().ok_or_else(|| {
+                    SbvcError::InvalidFormat(
+                        "Expected version metadata".to_string(),
+                    )
+                })?);
+
+            let name = str::from_utf8(meta.next().ok_or_else(|| {
+                SbvcError::InvalidFormat("Expected version name".to_string())
+            })?)?
+            .to_string();
+
+            let date = SystemTime::UNIX_EPOCH
+                + Duration::from_secs(
+                    str::from_utf8(meta.next().ok_or_else(|| {
+                        SbvcError::InvalidFormat(
+                            "Expected version creation date".to_string(),
+                        )
+                    })?)?
+                    .parse()?,
+                );
+
+            let mut difference = OwnedDifference::empty();
+
+            for deletion in
+                NelfIter::from_string(iter.next().ok_or_else(|| {
+                    SbvcError::InvalidFormat(
+                        "Expected version deletions".to_string(),
+                    )
+                })?)
+                .map(|source| -> SbvcResult<Deletion> {
+                    let mut iter = NelfIter::from_string(source);
+
+                    let start: usize =
+                        str::from_utf8(iter.next().ok_or_else(|| {
+                            SbvcError::InvalidFormat(
+                                "Expected deletion start".to_string(),
+                            )
+                        })?)?
+                        .parse()?;
+
+                    let end: usize =
+                        str::from_utf8(iter.next().ok_or_else(|| {
+                            SbvcError::InvalidFormat(
+                                "Expected deletion end".to_string(),
+                            )
+                        })?)?
+                        .parse()?;
+
+                    Ok(Deletion { start, end })
+                })
+            {
+                difference.deletions.push(deletion?);
+            }
+
+            for insertion in
+                NelfIter::from_string(iter.next().ok_or_else(|| {
+                    SbvcError::InvalidFormat(
+                        "Expected version insertions".to_string(),
+                    )
+                })?)
+                .map(
+                    |source| -> SbvcResult<OwnedInsertion<u8>> {
+                        let mut iter = NelfIter::from_string(source);
+
+                        let start: usize =
+                            str::from_utf8(iter.next().ok_or_else(|| {
+                                SbvcError::InvalidFormat(
+                                    "Expected insertion start".to_string(),
+                                )
+                            })?)?
+                            .parse()?;
+
+                        let data = iter
+                            .next()
+                            .ok_or_else(|| {
+                                SbvcError::InvalidFormat(
+                                    "Expected insertion data".to_string(),
+                                )
+                            })?
+                            .to_vec();
+
+                        Ok(OwnedInsertion { start, data })
+                    },
+                )
+            {
+                difference.insertions.push(insertion?);
+            }
+
+            Ok(Version { id, base, name, date, difference })
+        }) {
+            versions.push(version?);
         }
 
-        let versions = Version::new(&pool).await?;
+        let current = versions
+            .iter()
+            .enumerate()
+            .find(|&(_, version)| version.id == current_id)
+            .map(|(index, _)| index)
+            .ok_or(SbvcError::VersionNotFound(current_id))?;
 
-        path.set_extension("");
-
-        let database =
-            Database(Arc::new(DatabaseInfo { path, pool, versions }));
-
-        database.versions().set_database(&database).await;
-
-        Ok(database)
+        Ok(Sbvc { path, file, current, next, versions })
     }
 
-    /// Creates a new weak pointer to `self`.
-    pub fn downgrade(&self) -> DatabaseWeak {
-        DatabaseWeak(Arc::downgrade(&self.0))
+    fn write(&self) -> SbvcResult<()> {
+        fs::write(
+            &self.path,
+            [
+                self.file.as_os_str().as_bytes(),
+                self.versions[self.current].id.to_string().as_bytes(),
+                self.next.to_string().as_bytes(),
+                &self
+                    .versions
+                    .iter()
+                    .map(|version| {
+                        [
+                            version.id.to_string().as_bytes(),
+                            version.base.to_string().as_bytes(),
+                            &[
+                                version.name.as_bytes(),
+                                version
+                                    .date
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                                    .to_string()
+                                    .as_bytes(),
+                            ]
+                            .to_newline_nelf(),
+                            &version
+                                .difference
+                                .deletions
+                                .iter()
+                                .map(|deletion| {
+                                    [
+                                        deletion.start.to_string().as_bytes(),
+                                        deletion.end.to_string().as_bytes(),
+                                    ]
+                                    .to_newline_nelf()
+                                })
+                                .to_newline_nelf(),
+                            &version
+                                .difference
+                                .insertions
+                                .iter()
+                                .map(|insertion| {
+                                    [
+                                        insertion.start.to_string().as_bytes(),
+                                        &insertion.data,
+                                    ]
+                                    .to_newline_nelf()
+                                })
+                                .to_newline_nelf(),
+                        ]
+                        .to_newline_nelf()
+                    })
+                    .to_newline_nelf(),
+            ]
+            .to_newline_nelf(),
+        )?;
+
+        Ok(())
     }
 
-    /// Closes all the connections to the database in the pool.
-    pub async fn close(self) {
-        self.0.pool.close().await;
+    fn data(&self, version: &Version) -> Vec<u8> {
+        if version.id != version.base {
+            let mut result =
+                self.data(&self.versions[self.version(version.base).unwrap()]);
+            result.patch(version.difference());
+            result
+        } else {
+            Vec::new()
+        }
     }
 
-    /// Returns path to file version of which is being controlled.
-    pub fn path(&self) -> PathBuf {
-        self.0.path.clone()
+    fn rollback(&self) -> SbvcResult<()> {
+        fs::write(&self.file, self.data(&self.versions[self.current]))?;
+        Ok(())
     }
 
-    /// Returns the root [`Version`].
+    /// Returns `true` if the traced file contents are not the same as the
+    /// content for the current version.
+    pub fn is_changed(&self) -> SbvcResult<bool> {
+        Ok(fs::read(&self.file)? == self.data(&self.versions[self.current]))
+    }
+
+    /// Switches to the specified version using its ID.
     ///
-    /// [`Version`]: Version
-    pub fn versions(&self) -> Version {
-        self.0.versions.clone()
+    /// `rollback` specifies whether the contents of the file should be changed
+    /// according to the version you are switching to. If `true`, file contents
+    /// will be changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an IO error happens or the supplied `id` is not
+    /// found in the version tree. If `rollback` is `false` never fails.
+    pub fn checkout(&mut self, id: u32, rollback: bool) -> SbvcResult<()> {
+        self.current =
+            self.version(id).ok_or(SbvcError::VersionNotFound(id))?;
+
+        if rollback {
+            self.rollback()?;
+        }
+
+        Ok(())
+    }
+
+    /// Saves changes in the file to a new version branching from the current
+    /// one.
+    ///
+    /// This method automatically checks out the newly created version.
+    ///
+    /// # Errors
+    ///
+    /// This method fails if an IO error occurs.
+    pub fn commit(&mut self) -> SbvcResult<()> {
+        let content = fs::read(&self.file)?;
+
+        self.versions.push(Version {
+            id: self.next,
+            base: self.versions[self.current].id,
+            name: DEFAULT_VERSION_NAME.to_string(),
+            date: SystemTime::now(),
+            // TODO Optimize for big files
+            difference: content
+                .diff(&self.data(&self.versions[self.current]))
+                .to_owned(),
+        });
+        self.next += 1;
+        self.current = self.versions.len() - 1;
+        self.write()
+    }
+
+    /// Renames the current version.
+    ///
+    /// # Errors
+    ///
+    /// This method returns an error when an IO error occurs.
+    pub fn rename(&mut self, name: &str) -> SbvcResult<()> {
+        self.versions[self.current].name.clear();
+        self.versions[self.current].name.push_str(name);
+        self.write()
+    }
+
+    /// Deletes version with the selected ID.
+    ///
+    /// This method does not delete the initial version.
+    ///
+    /// # Errors
+    ///
+    /// This method returns an error when and IO error occurs.
+    pub fn delete(&mut self) -> SbvcResult<()> {
+        let current = self.current;
+        self.checkout(self.versions[self.current].base, true)?;
+        self.delete_private(current);
+        self.write()
+    }
+
+    fn delete_private(&mut self, index: usize) {
+        let id = self.versions[index].id;
+
+        if id != self.versions[index].base {
+            while let Some(index) = self
+                .versions
+                .iter()
+                .enumerate()
+                .find(|&(_, version)| version.base == id)
+                .map(|(index, _)| index)
+            {
+                self.delete_private(index);
+            }
+
+            self.versions.remove(self.version(id).unwrap());
+        }
+    }
+
+    /// Returns the path to the version tree file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the path to the tracked file.
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// Returns a reference to the current version (For info).
+    pub fn current(&self) -> &Version {
+        &self.versions[self.current]
+    }
+
+    fn version(&self, id: u32) -> Option<usize> {
+        self.versions
+            .iter()
+            .enumerate()
+            .find(|&(_, version)| version.id == id)
+            .map(|(index, _)| index)
+    }
+
+    /// Returns a slice of all versions.
+    pub fn versions(&self) -> &[Version] {
+        &self.versions
     }
 }
 
-/// A weak pointer to [`Database`].
-///
-/// [`Database`]: Database
-#[derive(Clone)]
-pub struct DatabaseWeak(Weak<DatabaseInfo>);
+trait ToNewlineNelf {
+    fn to_newline_nelf(self) -> Vec<u8>;
+}
 
-impl DatabaseWeak {
-    /// A convinience method that constructs a [`DatabaseWeak`] that does not
-    /// point to anything.
-    ///
-    /// Calling [`upgrade`] method on the returned value will result in
-    /// [`None`].
-    ///
-    /// [`DatabaseWeak`]: DatabaseWeak
-    /// [`upgrade`]: DatabaseWeak::upgrade
-    /// [`None`]: None
-    pub fn new() -> DatabaseWeak {
-        DatabaseWeak(Weak::new())
-    }
-
-    /// Attempts to upgrade value in `self` into a [`Database`].
-    ///
-    /// [`Database`]: Database
-    pub fn upgrade(&self) -> Option<Database> {
-        self.0.upgrade().map(|info| Database(info))
+impl<T: IntoIterator<Item = V>, V: ToCell> ToNewlineNelf for T {
+    fn to_newline_nelf(self) -> Vec<u8> {
+        self.into_iter()
+            .flat_map(|string| {
+                let mut cell = string.to_cell();
+                cell.push(b'\n');
+                cell
+            })
+            .collect()
     }
 }
 
-struct VersionInfo {
+/// An immutable representation of a version
+#[derive(Debug, Clone)]
+pub struct Version {
     id: u32,
-    base: VersionWeak,
+    base: u32,
     name: String,
-    date: String,
+    date: SystemTime,
     difference: OwnedDifference<u8>,
-    children: Vec<Version>,
-    database: DatabaseWeak,
 }
-
-/// A `struct` that represents a single commit in the version tree. It uses
-/// [`Arc`] under the hood, so it is okay to [`clone`] it, as it has very little
-/// cost.
-///
-/// [`Arc`]: Arc
-/// [`clone`]: Clone::clone
-#[derive(Clone)]
-pub struct Version(Arc<RwLock<VersionInfo>>);
 
 impl Version {
-    async fn new(pool: &SqlitePool) -> sqlx::Result<Self> {
-        let stream = sqlx::query_as("SELECT id, bid, name, date FROM versions")
-            .fetch(pool)
-            .try_filter_map(|(id, bid, name, date)| {
-                Box::pin(async move {
-                    let deletions = sqlx::query_as(
-                        "SELECT start, end FROM deletions
-                        WHERE id = ? ORDER BY start",
-                    )
-                    .bind(id)
-                    .fetch(pool)
-                    .try_filter_map(|(start, end): (u32, u32)| async move {
-                        Ok(Some(start as usize..end as usize))
-                    })
-                    .try_collect();
-
-                    let insertions = sqlx::query_as(
-                        "SELECT start, data FROM insertions
-                        WHERE id = ? ORDER by start",
-                    )
-                    .bind(id)
-                    .fetch(pool)
-                    .try_filter_map(|(start, data): (u32, _)| async move {
-                        Ok(Some(OwnedInsertion::new(start as usize, data)))
-                    })
-                    .try_collect();
-
-                    let (deletions, insertions) = join!(deletions, insertions);
-                    let deletions = deletions?;
-                    let insertions = insertions?;
-
-                    Ok(Some((
-                        VersionInfo {
-                            id,
-                            base: VersionWeak::new(),
-                            name,
-                            date,
-                            difference: OwnedDifference::new(
-                                deletions, insertions,
-                            ),
-                            children: Vec::new(),
-                            database: DatabaseWeak::new(),
-                        },
-                        bid,
-                    )))
-                })
-            });
-
-        let mut map = HashMap::new();
-
-        stream
-            .try_for_each_concurrent(None, |(info, bid)| {
-                map.insert(
-                    info.id,
-                    (Version(Arc::new(RwLock::new(info))), bid),
-                );
-                future::ready(Ok(()))
-            })
-            .await?;
-
-        let mut root = VersionWeak::new();
-
-        for (version, bid) in map.values() {
-            if let Some(bid) = bid {
-                let parent = async {
-                    map[bid].0 .0.write().await.children.push(version.clone());
-                };
-                let child = async {
-                    version.0.write().await.base = map[bid].0.downgrade();
-                };
-                join!(parent, child);
-            } else {
-                root = version.downgrade();
-            }
-        }
-
-        Ok(root.upgrade().unwrap())
+    /// Returns the version ID.
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
-    fn set_database<'a>(
-        &'a self,
-        database: &'a Database,
-    ) -> Pin<Box<dyn 'a + Send + Sync + Future<Output = ()>>> {
-        Box::pin(async move {
-            self.0.write().await.database = database.downgrade();
-
-            for child in &self.0.read().await.children {
-                child.set_database(database).await;
-            }
-        })
+    /// Returns the base version ID.
+    pub fn base(&self) -> u32 {
+        self.base
     }
 
-    /// Returns contents of the controlled file in given version.
-    ///
-    /// This method does not cache anything or use any cached values. Instead,
-    /// it calculates contents of the file every time this method is called
-    /// using differences contained in the database, so you should either cache
-    /// contents yourself, or do not call this method very often.
-    pub fn data(
-        &self,
-    ) -> Pin<Box<dyn '_ + Send + Sync + Future<Output = Vec<u8>>>> {
-        Box::pin(async {
-            let read = self.0.read().await;
-            if let Some(base) = read.base.upgrade() {
-                let mut vec = base.data().await;
-                vec.patch(read.difference.borrow());
-                vec
-            } else {
-                Vec::new()
-            }
-        })
+    /// Returns the version name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Deletes given version and all its children from the version tree.
-    ///
-    /// # Errors
-    ///
-    /// This method returns an error if error happens while deleting records
-    /// from the database.
-    pub async fn delete(&self) -> sqlx::Result<()> {
-        let parent = async {
-            let read = self.0.read().await;
-
-            if let Some(base) = read.base.upgrade() {
-                let children = &mut base.0.write().await.children;
-                let mut found = None;
-                for (index, version) in children.iter().enumerate() {
-                    if version.0.read().await.id == read.id {
-                        found = Some(index);
-                        break;
-                    }
-                }
-                children.remove(found.unwrap());
-            }
-        };
-
-        let children = self.delete_private();
-
-        let (_, children) = join!(parent, children);
-        children?;
-
-        Ok(())
+    /// Returns the version creation time.
+    pub fn date(&self) -> SystemTime {
+        self.date
     }
 
-    fn delete_private(
-        &self,
-    ) -> Pin<Box<dyn '_ + Send + Future<Output = sqlx::Result<()>>>> {
-        Box::pin(async {
-            let read = self.0.read().await;
-
-            let children = async {
-                for child in &read.children {
-                    child.delete_private().await?;
-                }
-
-                Ok(())
-            };
-
-            let database = read.database.upgrade().unwrap();
-
-            let deletions = sqlx::query("DELETE FROM deletions WHERE id = ?")
-                .bind(read.id)
-                .execute(&database.0.pool);
-            let insertions = sqlx::query("DELETE FROM insertions WHERE id = ?")
-                .bind(read.id)
-                .execute(&database.0.pool);
-
-            let (children, deletions, insertions): (sqlx::Result<()>, _, _) =
-                join!(children, deletions, insertions);
-            children?;
-            deletions?;
-            insertions?;
-
-            sqlx::query("DELETE FROM versions WHERE id = ?")
-                .bind(read.id)
-                .execute(&database.0.pool)
-                .await?;
-
-            Ok(())
-        })
-    }
-
-    /// Rolls the controlled file back to its state at given version.
-    ///
-    /// # Errors
-    ///
-    /// This method returns an error if an IO error occurs while trying to write
-    /// into the file.
-    pub async fn rollback(&self) -> io::Result<()> {
-        let read = self.0.read();
-        let data = self.data();
-
-        let (read, data) = join!(read, data);
-
-        File::create(&read.database.upgrade().unwrap().0.path)?.write(&data)?;
-        Ok(())
-    }
-
-    /// Renames the version to given name.
-    ///
-    /// # Errors
-    ///
-    /// This method returns an error if an error occurs while trying to update
-    /// values in the database.
-    pub async fn rename(&self, name: String) -> sqlx::Result<()> {
-        let read = self.0.read().await;
-
-        sqlx::query("UPDATE versions SET name = ? WHERE id = ?")
-            .bind(&name)
-            .bind(read.id)
-            .execute(&read.database.upgrade().unwrap().0.pool)
-            .await?;
-
-        drop(read);
-
-        self.0.write().await.name = name;
-
-        Ok(())
-    }
-
-    /// Commits file's new state into the version tree.
-    ///
-    /// The new version will be child of `self`.
-    ///
-    /// # Errors
-    ///
-    /// This method returns an error if an error occurs while trying to insert
-    /// values into the database.
-    pub async fn commit(&self) -> sqlx::Result<()> {
-        let read = self.0.read().await;
-
-        let database = read.database.upgrade().unwrap();
-
-        let query = sqlx::query_as(
-            "INSERT INTO versions(bid, name, date)
-            VALUES(?, ?, datetime(\"now\", \"localtime\"))
-            RETURNING id, name, date",
-        )
-        .bind(read.id)
-        .bind(DEFAULT_VERSION_NAME)
-        .fetch_one(&database.0.pool);
-
-        let old = self.data();
-
-        let (query, old) = join!(query, old);
-        let (id, name, date) = query?;
-
-        let mut new = Vec::new();
-        File::open(&read.database.upgrade().unwrap().0.path)?
-            .read_to_end(&mut new)?;
-
-        let chunk_size = (old.len().min(new.len()) / 1_000).max(1);
-
-        let old = old.chunks(chunk_size).collect();
-        let new: Vec<_> = new.chunks(chunk_size).collect();
-
-        let mut difference = new.diff(&old);
-
-        for Deletion { start, end } in &mut difference.deletions {
-            let new_start = *start * chunk_size;
-            *end = new_start
-                + old[*start..*end]
-                    .iter()
-                    .fold(0, |result, chunk| result + chunk.len());
-            *start = new_start;
-        }
-
-        let difference = OwnedDifference::new(
-            difference.deletions,
-            difference
-                .insertions
-                .into_iter()
-                .map(|insertion| {
-                    OwnedInsertion::new(
-                        insertion.start * chunk_size,
-                        insertion
-                            .data
-                            .into_iter()
-                            .map(|slice| slice.iter())
-                            .flatten()
-                            .map(Clone::clone)
-                            .collect(),
-                    )
-                })
-                .collect(),
-        );
-
-        let deletions = async {
-            for Deletion { start, end } in &difference.deletions {
-                sqlx::query(
-                    "INSERT INTO deletions(id, start, end) VALUES(?, ?, ?)",
-                )
-                .bind(id)
-                .bind(*start as u32)
-                .bind(*end as u32)
-                .execute(&database.0.pool)
-                .await?;
-            }
-            Ok(())
-        };
-
-        let insertions = async {
-            for OwnedInsertion { start, data } in &difference.insertions {
-                sqlx::query(
-                    "INSERT INTO insertions(id, start, data) VALUES(?, ?, ?)",
-                )
-                .bind(id)
-                .bind(*start as u32)
-                .bind(data)
-                .execute(&database.0.pool)
-                .await?;
-            }
-            Ok(())
-        };
-
-        let (deletions, insertions): (sqlx::Result<()>, sqlx::Result<()>) =
-            join!(deletions, insertions);
-        deletions?;
-        insertions?;
-
-        let info = VersionInfo {
-            id,
-            base: self.downgrade(),
-            name,
-            date,
-            difference,
-            children: Vec::new(),
-            database: database.downgrade(),
-        };
-
-        drop(read);
-
-        self.0
-            .write()
-            .await
-            .children
-            .push(Version(Arc::new(RwLock::new(info))));
-
-        Ok(())
-    }
-
-    /// Creates a new weak pointer to `self`.
-    pub fn downgrade(&self) -> VersionWeak {
-        VersionWeak(Arc::downgrade(&self.0))
-    }
-
-    /// Returns ID of the version.
-    pub async fn id(&self) -> u32 {
-        self.0.read().await.id
-    }
-
-    /// Returns parent version of `self`. Returns [`None`] if there is none.
-    ///
-    /// [`None`]: None
-    pub async fn base(&self) -> Option<Version> {
-        self.0.read().await.base.upgrade()
-    }
-
-    /// Returns name of the version.
-    pub async fn name(&self) -> String {
-        self.0.read().await.name.clone()
-    }
-
-    /// Returns date when the version was commited.
-    ///
-    /// This method returns [`String`] representation of the date in the same
-    /// format it was stores in the database.
-    ///
-    /// [`String`]: String
-    pub async fn date(&self) -> String {
-        self.0.read().await.date.clone()
-    }
-
-    /// Returns number of deletions from the file in this version.
-    pub async fn deletions(&self) -> usize {
-        self.0.read().await.difference.deletions.len()
-    }
-
-    /// Returns number of insertions into the file in this version.
-    pub async fn insertions(&self) -> usize {
-        self.0.read().await.difference.insertions.len()
-    }
-
-    /// Returns all the children of the version.
-    pub async fn children(&self) -> Vec<Version> {
-        self.0.read().await.children.clone()
-    }
-}
-
-/// A weak pointer to [`Version`].
-///
-/// [`Version`]: Version
-#[derive(Clone)]
-pub struct VersionWeak(Weak<RwLock<VersionInfo>>);
-
-impl VersionWeak {
-    /// A convinience method that constructs a [`VersionWeak`] that does not
-    /// point to anything.
-    ///
-    /// Calling [`upgrade`] method on the returned value will result in
-    /// [`None`].
-    ///
-    /// [`VersionWeak`]: VersionWeak
-    /// [`upgrade`]: VersionWeak::upgrade
-    /// [`None`]: None
-    pub fn new() -> VersionWeak {
-        VersionWeak(Weak::new())
-    }
-
-    /// Attempts to upgrade value in `self` into a [`Version`].
-    ///
-    /// [`Version`]: Version
-    pub fn upgrade(&self) -> Option<Version> {
-        self.0.upgrade().map(|info| Version(info))
+    /// Returns the difference of this version from the base version.
+    pub fn difference(&self) -> Difference<u8> {
+        self.difference.borrow()
     }
 }

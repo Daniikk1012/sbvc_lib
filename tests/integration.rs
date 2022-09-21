@@ -1,128 +1,88 @@
-use std::fs;
+use std::{fs, str};
 
-use sbvc_lib::Database;
+use sbvc_lib::{Sbvc, SbvcResult};
 
-#[cfg_attr(feature = "async-std", async_std::test)]
-#[cfg_attr(feature = "tokio", tokio::test)]
-async fn create() -> sqlx::Result<()> {
-    const FILE: &'static str = "creation";
-    const DATABASE: &'static str = "creation.db";
+#[test]
+fn create() -> SbvcResult<()> {
+    const PATH: &str = "creation.nelf";
+    const FILE: &str = "creation";
 
-    Database::new(FILE.into()).await?.close().await;
-
-    fs::remove_file(DATABASE)?;
-
+    Sbvc::new(PATH.into(), FILE.into())?;
+    fs::remove_file(PATH)?;
     Ok(())
 }
 
-#[cfg_attr(feature = "async-std", async_std::test)]
-#[cfg_attr(feature = "tokio", tokio::test)]
-async fn data() -> sqlx::Result<()> {
-    const FILE: &'static str = "data";
-    const DATABASE: &'static str = "data.db";
-    const DATA_1: &'static [u8] = b"SOME DATA TO PUT INTO FILE";
-    const DATA_2: &'static [u8] = b"SOME OTHER DATA TO REPLACE WHAT WAS BEFORE";
+#[test]
+fn rollback() -> SbvcResult<()> {
+    const PATH: &str = "rollback.nelf";
+    const FILE: &str = "rollback";
+    const DATA_1: &[u8] = b"SOME DATA TO PUT INTO FILE";
+    const DATA_2: &[u8] = b"SOME OTHER DATA TO REPLACE WHAT WAS BEFORE";
 
-    let database = Database::new(FILE.into()).await?;
+    let _ = fs::remove_file(FILE);
+
+    let mut sbvc = Sbvc::new(PATH.into(), FILE.into())?;
+    assert!(sbvc.is_changed().is_err());
     fs::write(FILE, DATA_1)?;
-    database.versions().commit().await?;
-    assert_eq!(database.versions().children().await[0].data().await, DATA_1);
-    database.close().await;
-
-    let database = Database::new(FILE.into()).await?;
+    assert!(!sbvc.is_changed()?);
+    sbvc.commit()?;
+    assert!(sbvc.is_changed()?);
     fs::write(FILE, DATA_2)?;
-    database.versions().children().await[0].commit().await?;
-    assert_eq!(database.versions().children().await[0].data().await, DATA_1);
-    assert_eq!(
-        database.versions().children().await[0].children().await[0]
-            .data()
-            .await,
-        DATA_2,
-    );
-    database.close().await;
+    sbvc.commit()?;
 
-    let database = Database::new(FILE.into()).await?;
-    assert_eq!(database.versions().children().await[0].data().await, DATA_1);
-    assert_eq!(
-        database.versions().children().await[0].children().await[0]
-            .data()
-            .await,
-        DATA_2,
-    );
-    database.close().await;
-
-    fs::remove_file(FILE)?;
-    fs::remove_file(DATABASE)?;
-
-    Ok(())
-}
-
-#[cfg_attr(feature = "async-std", async_std::test)]
-#[cfg_attr(feature = "tokio", tokio::test)]
-async fn delete() -> sqlx::Result<()> {
-    const FILE: &'static str = "delete";
-    const DATABASE: &'static str = "delete.db";
-    const DATA_1: &'static [u8] = b"SOME DATA TO PUT INTO FILE";
-    const DATA_2: &'static [u8] = b"SOME OTHER DATA TO REPLACE WHAT WAS BEFORE";
-
-    let database = Database::new(FILE.into()).await?;
-    fs::write(FILE, DATA_1)?;
-    database.versions().commit().await?;
-    fs::write(FILE, DATA_2)?;
-    database.versions().children().await[0].commit().await?;
-    database.versions().children().await[0].delete().await?;
-    database.close().await;
-
-    let database = Database::new(FILE.into()).await?;
-    assert!(database.versions().children().await.is_empty());
-    database.close().await;
-
-    fs::remove_file(FILE)?;
-    fs::remove_file(DATABASE)?;
-
-    Ok(())
-}
-
-#[cfg_attr(feature = "async-std", async_std::test)]
-#[cfg_attr(feature = "tokio", tokio::test)]
-async fn rollback() -> sqlx::Result<()> {
-    const FILE: &'static str = "rollback";
-    const DATABASE: &'static str = "rollback.db";
-    const DATA_1: &'static [u8] = b"SOME DATA TO PUT INTO FILE";
-    const DATA_2: &'static [u8] = b"SOME OTHER DATA TO REPLACE WHAT WAS BEFORE";
-
-    let database = Database::new(FILE.into()).await?;
-    fs::write(FILE, DATA_1)?;
-    database.versions().commit().await?;
-    fs::write(FILE, DATA_2)?;
-    database.versions().children().await[0].commit().await?;
-    database.versions().children().await[0].rollback().await?;
+    let mut sbvc = Sbvc::open(PATH.into())?;
+    sbvc.checkout(1, true)?;
     assert_eq!(fs::read(FILE)?, DATA_1);
-    database.close().await;
+    sbvc.checkout(2, true)?;
+    assert_eq!(fs::read(FILE)?, DATA_2);
 
+    fs::remove_file(PATH)?;
     fs::remove_file(FILE)?;
-    fs::remove_file(DATABASE)?;
 
     Ok(())
 }
 
-#[cfg_attr(feature = "async-std", async_std::test)]
-#[cfg_attr(feature = "tokio", tokio::test)]
-async fn rename() -> sqlx::Result<()> {
-    const FILE: &'static str = "rename";
-    const DATABASE: &'static str = "rename.db";
-    const NAME: &'static str = "new name";
+#[test]
+fn delete() -> SbvcResult<()> {
+    const PATH: &str = "delete.nelf";
+    const FILE: &str = "delete";
+    const DATA_1: &[u8] = b"SOME DATA TO PUT INTO FILE";
+    const DATA_2: &[u8] = b"SOME OTHER DATA TO REPLACE WHAT WAS BEFORE";
 
-    let database = Database::new(FILE.into()).await?;
-    database.versions().rename(NAME.to_string()).await?;
-    assert_eq!(database.versions().name().await, NAME);
-    database.close().await;
+    let mut sbvc = Sbvc::new(PATH.into(), FILE.into())?;
+    fs::write(FILE, DATA_1)?;
+    sbvc.commit()?;
+    fs::write(FILE, DATA_2)?;
+    sbvc.commit()?;
+    sbvc.commit()?;
+    sbvc.checkout(2, true)?;
+    sbvc.delete()?;
 
-    let database = Database::new(FILE.into()).await?;
-    assert_eq!(database.versions().name().await, NAME);
-    database.close().await;
+    let sbvc = Sbvc::open(PATH.into())?;
+    assert_eq!(
+        sbvc.versions().iter().map(|version| version.id()).collect::<Vec<_>>(),
+        [0, 1]
+    );
 
-    fs::remove_file(DATABASE)?;
+    fs::remove_file(PATH)?;
+    fs::remove_file(FILE)?;
+
+    Ok(())
+}
+
+#[test]
+fn rename() -> SbvcResult<()> {
+    const PATH: &str = "rename.nelf";
+    const FILE: &str = "rename";
+    const NAME: &str = "new name";
+
+    let mut sbvc = Sbvc::new(PATH.into(), FILE.into())?;
+    sbvc.rename(NAME)?;
+
+    let sbvc = Sbvc::open(PATH.into())?;
+    assert_eq!(sbvc.current().name(), NAME);
+
+    fs::remove_file(PATH)?;
 
     Ok(())
 }

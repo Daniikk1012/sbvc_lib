@@ -3,41 +3,10 @@ name = "sbvc_lib"
 description = "Backend for Single Binary file Version Control system"
 readme = "README.md"
 repository = "https://github.com/Daniikk1012/sbvc_lib"
-version = "0.3.1"
+version = "0.5.0"
 edition = "2021"
 license = "GPL-3.0"
 
 [dependencies]
-futures = "0.3"
-sqlx = { version = "0.5", features = ["sqlite"] }
+nelf = "0.1"
 wgdiff = "0.4"
-async-std = { version = "1.10", features = ["attributes"], optional = true }
-tokio = { version = "1.14", features = ["macros"], optional = true }
-
-[features]
-default = ["runtime-async-std-rustls"]
-
-runtime-actix-native-tls = [
-    "tokio",
-    "sqlx/runtime-actix-native-tls",
-]
-runtime-async-std-native-tls = [
-    "async-std",
-    "sqlx/runtime-async-std-native-tls",
-]
-runtime-tokio-native-tls = [
-    "tokio",
-    "sqlx/runtime-tokio-native-tls",
-]
-runtime-actix-rustls = [
-    "tokio",
-    "sqlx/runtime-actix-rustls",
-]
-runtime-async-std-rustls = [
-    "async-std",
-    "sqlx/runtime-async-std-rustls",
-]
-runtime-tokio-rustls = [
-    "tokio",
-    "sqlx/runtime-tokio-rustls",
-]
