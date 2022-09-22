@@ -18,12 +18,10 @@
 
 use std::{
     error::Error,
-    ffi::OsStr,
     fmt,
     fmt::{Display, Formatter},
     fs, io,
     num::ParseIntError,
-    os::unix::prelude::OsStrExt,
     path::{Path, PathBuf},
     str::{self, Utf8Error},
     time::{Duration, SystemTime},
@@ -146,9 +144,9 @@ impl Sbvc {
         let source = fs::read(&path)?;
         let mut iter = NelfIter::from_string(&source);
 
-        let file = OsStr::from_bytes(iter.next().ok_or_else(|| {
+        let file = str::from_utf8(iter.next().ok_or_else(|| {
             SbvcError::InvalidFormat("Expected filename".to_string())
-        })?)
+        })?)?
         .into();
 
         let current_id = str::from_utf8(iter.next().ok_or_else(|| {
@@ -287,7 +285,7 @@ impl Sbvc {
         fs::write(
             &self.path,
             [
-                self.file.as_os_str().as_bytes(),
+                self.file.as_os_str().to_str().unwrap().as_bytes(),
                 self.versions[self.current].id.to_string().as_bytes(),
                 self.next.to_string().as_bytes(),
                 &self
