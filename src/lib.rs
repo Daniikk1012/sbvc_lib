@@ -465,6 +465,16 @@ impl Sbvc {
         &self.file
     }
 
+    /// Sets the tracked file for this version tree.
+    ///
+    /// # Errors
+    ///
+    /// Fails if an IO error occurs.
+    pub fn set_file(&mut self, file: PathBuf) -> SbvcResult<()> {
+        self.file = file;
+        self.write()
+    }
+
     /// Returns a reference to the current version (For info).
     pub fn current(&self) -> &Version {
         &self.versions[self.current]
