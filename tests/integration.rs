@@ -24,9 +24,9 @@ fn rollback() -> SbvcResult<()> {
     let mut sbvc = Sbvc::new(PATH.into(), FILE.into())?;
     assert!(sbvc.is_changed().is_err());
     fs::write(FILE, DATA_1)?;
-    assert!(!sbvc.is_changed()?);
-    sbvc.commit()?;
     assert!(sbvc.is_changed()?);
+    sbvc.commit()?;
+    assert!(!sbvc.is_changed()?);
     fs::write(FILE, DATA_2)?;
     sbvc.commit()?;
 

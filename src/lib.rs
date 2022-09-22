@@ -362,7 +362,7 @@ impl Sbvc {
     /// Returns `true` if the traced file contents are not the same as the
     /// content for the current version.
     pub fn is_changed(&self) -> SbvcResult<bool> {
-        Ok(fs::read(&self.file)? == self.data(&self.versions[self.current]))
+        Ok(fs::read(&self.file)? != self.data(&self.versions[self.current]))
     }
 
     /// Switches to the specified version using its ID.
